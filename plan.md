@@ -1,0 +1,309 @@
+# xreenshoty — Project Plan
+
+## Goal
+Local-first screenshot capture and later retrieval, fully offline. Match XFCE
+Screenshot behaviour for capture first; only then add local models for search.
+
+Status: Milestones 1–4 and 5.0-5.6 implemented. Next is Milestone 6 (hybrid retrieval).
+
+## Stack
+
+| Concern | Choice | Notes |
+|---|---|---|
+| Desktop | Tauri 2 + React 19 + Tailwind 4 | |
+| Capture | `screenshots = "0.8"` | X11 today; `xcap` when MX repos sync |
+| Files | `~/Pictures` | Source of truth, never the DB |
+| Metadata | SQLite via `rusqlite` (bundled) | `~/.local/share/xreenshoty/screenshots.db` |
+| Keyword search | SQLite FTS5 | Built into bundled SQLite |
+| OCR | **tesseract 5.5.0** (already installed) | See M5 decisions |
+| Embeddings | **EmbeddingGemma 2**, image → 768-d | Served by llama.cpp, Vulkan backend |
+| Vector store | **sqlite-vec** (`vec0` virtual table) | Replaces LanceDB |
+| Speech-to-text | **Whistle** 16.9 MB via `cactus-needle` | Replaces Phonon-2 |
+| Answer model | **already in Ollama**: `LFM2.5-1.2B`, `gemma3:1b` | No new download needed |
+
+All inference is local. Nothing leaves the machine.
+
+### Python: not required
+
+The whole AI stack can run **without Python in the app**:
+
+| Component | Runtime | Python? |
+|---|---|---|
+| Embeddings | `llama-server` (native binary, Vulkan) over HTTP | No |
+| Answer model | Ollama (Go binary) over HTTP | No |
+| OCR | `tesseract` (C++) | No |
+| Vector search | sqlite-vec, statically linked into our Rust binary | No |
+| Voice (M6 only) | `cactus-needle` / Whistle | **Yes — isolated** |
+
+The Rust app talks plain HTTP to two localhost servers. Python appears only for
+voice in Milestone 6, as a separate process that the app shells out to; if that
+proves painful it is the one piece to cut.
+
+---
+
+## Milestone 1–4 (done)
+
+Milestones 1–3 are capture and capture UX; Milestone 4 is the SQLite index.
+See `AGENTS.md` for the implementation notes and the build traps. Open
+verification items are tracked in Milestone 5's "carry-over" list.
+
+---
+
+## Milestone 5 — OCR, embeddings, indexing
+
+### Decisions taken (researched, not assumed)
+
+**OCR: tesseract, not Xiaomi-OCR-0.** Xiaomi-OCR-0 is real (`SeerRay-Lab`, 0.8B,
+Qwen3.5-based) but its published benchmarks are OmniDocBench / DocVQA / InfoVQA —
+scanned, warped and photographed **documents**. Two problems on this machine:
+1. It only runs behind an SGLang or vLLM **server process with a GPU**. There is
+   no GPU here (Intel UHD iGPU), and it would add a Python runtime to a Rust app.
+2. It is document-tuned, not UI-screenshot-tuned.
+
+tesseract 5.5.0 is already installed (`eng` + `osd`), is CPU-only, starts in
+milliseconds, and handles UI text fine. Revisit Xiaomi-OCR-0 only if search
+quality on real screenshots is demonstrably weak.
+
+**Vectors: sqlite-vec, not LanceDB.** 768 dims × 4 bytes = 3 KB per screenshot;
+369 images ≈ 1.1 MB. LanceDB would mean a second storage engine, a second on-disk
+format, and a cross-store join to recover `screenshot_id`. sqlite-vec keeps
+vectors in the SQLite file we already open, so `ocr_text`, `embedding` and
+`path` live in one row in one transaction. It is pre-v1 (`0.1.9`), which is the
+main risk to watch (R2).
+
+**Embeddings: llama.cpp, Vulkan backend, image input.** Confirmed the GGUF repo
+`ggml-org/embeddinggemma-2-GGUF` ships both halves in Q8:
+
+```
+295.5 MB  embeddinggemma-2-Q8_0.gguf        text tower (270M)
+529.1 MB  mmproj-embeddinggemma-2-Q8_0.gguf vision projector (170M + 300M audio)
+          ── 824.6 MB resident total
+```
+
+That projector is the piece that decides whether images work at all, and it
+exists. So `llama-server -hf ggml-org/embeddinggemma-2-GGUF:Q8_0 --mmproj
+... --pooling ...` should serve image embeddings from `/v1/embeddings`.
+825 MB fits the current 2 GB headroom, and fits trivially once the Arc card is
+enabled.
+
+Ollama is not an option for this model: `/api/embed` is text-only and
+multimodal embeddings are still an open feature request (ollama #5304).
+
+**Every path considered for EmbeddingGemma 2** (in preference order):
+
+| Path | Image input | Cost | Verdict |
+|---|---|---|---|
+| llama.cpp Vulkan + mmproj | Yes, via `--mmproj` | one native binary, GPU offload | **Use this** |
+| llama.cpp SYCL + mmproj | Yes | needs Intel oneAPI toolkit (~2 GB) | fallback if Vulkan misbehaves |
+| OpenVINO | needs an ONNX export first | Intel-native, strong on Arc | consider only if Vulkan fails |
+| llama.cpp CPU + mmproj | Yes | no GPU, ~825 MB in RAM | works today while GPU is sorted |
+| transformers / PyTorch | Yes | Python + torch, multi-GB | only if llama.cpp cannot load the projector |
+| ONNX Runtime | needs ONNX export | extra runtime | not yet |
+
+**GPU: Intel Arc A530M is enabled and working.** Verified:
+- `03:00.0 Intel DG2 [Arc A530M]` on PCIe, `renderD129`, driven by `xe`/`i915`.
+- Vulkan exposes it as `PHYSICAL_DEVICE_TYPE_DISCRETE_GPU`, Mesa 25.0.7, API 1.4.305.
+- **`VK_KHR_cooperative_matrix` is supported** (revision 2), so llama.cpp's Vulkan
+  backend will use the XMX matrix engines. An earlier note in this plan claimed
+  Mesa ≥26.1 was required for that — that was wrong for this card; it works on 25.0.7.
+- 4 GB dedicated VRAM exposed as a prefetchable PCI BAR.
+- No OpenCL ICD and no Level Zero device, so OpenVINO/oneAPI paths would need
+  `intel-opencl-icd` installed first. The Vulkan path needs none of that.
+
+Device ordering for llama.cpp is stable: **0 = UHD 770 iGPU, 1 = Arc A530M,
+2 = llvmpipe**. Set `GGML_VK_VISIBLE_DEVICES=1` to pin inference to the Arc and
+leave the iGPU for the desktop compositor.
+
+**Speech-to-text: Whistle.** Phonon-2 is real but **MLX/Apple-Silicon only** and
+English-only, so it cannot run on MX Linux x86_64. Whistle (`Cactus-Compute`) is
+16.9 MB, 7 languages, 11 ms to first token, and ships with the same runtime as
+`cactus-needle`, so `pip install cactus-needle` covers both.
+
+**Answer model: already present.** Ollama 0.34.0 has `LFM2.5-1.2B-Instruct-GGUF`
+(Q5_K_M, 843 MB), `gemma3:1b`, `qwen3.5:0.8b` and `qwen2.5:1.5b` pulled. All are
+under 2B, which satisfies the original constraint with zero downloads. Ollama can
+also use the GPU once the Arc card is visible.
+
+### Risks
+
+- **R1 (RESOLVED, see spike above): image embeddings work.** llama.cpp build
+  11541+ serves both text and screenshots as 768-d vectors in a shared space,
+  0.40 s per image on the Arc. Use the native `/embedding` endpoint with the
+  `image` field; `/v1/embeddings` cannot take images.
+- **R2: sqlite-vec is pre-v1** (`0.1.9`). Expect breaking changes; pin it.
+- **R3: memory.** 825 MB of model must fit alongside a running desktop. Today
+  ~2.4 GB RAM is available (7.5 GB total, 12 cores, 6 GB swap + 7.5 GB zram).
+  With the Arc card enabled the model can live in its 4 GB of dedicated VRAM
+  instead, which is the better arrangement.
+- **R4 (resolved): Mesa version is fine.** An earlier draft warned that Arc
+  needs Mesa ≥26.1 for `VK_KHR_cooperative_matrix`. Checked on the actual card:
+  it is supported on Mesa 25.0.7, so no PPA or driver upgrade is needed.
+- **R5: tesseract is English-only here.** Extra languages need
+  `tesseract-ocr-<lang>` packages.
+
+### Spike 5.0 findings (the facts, so nobody re-derives them)
+
+**Runtime layout** (`~/apps`, outside the repo):
+
+```
+~/apps/llama-b11541/                     prebuilt Vulkan llama.cpp (87 MB)
+~/apps/models/embeddinggemma-2-Q8_0.gguf         text tower  (296 MB)
+~/apps/models/mmproj-embeddinggemma-2-Q8_0.gguf  projector  (530 MB)
+```
+
+**Version trap.** llama.cpp merged EmbeddingGemma 2 support in PR #30054 on
+2026-10-06. The `b11429` prebuilt is from 2026-10-05 and fails with
+`unknown model architecture: 'gemma-embedding2'`. Any build from before
+2026-10-06 is useless. `b11541` works. There is no prebuilt newer than the
+nightly, so check the build date before debugging anything else.
+
+**Launch command:**
+
+```bash
+GGML_VK_VISIBLE_DEVICES=1 ~/apps/llama-b11541/llama-server \
+  -m ~/apps/models/embeddinggemma-2-Q8_0.gguf \
+  --mmproj ~/apps/models/mmproj-embeddinggemma-2-Q8_0.gguf \
+  --embeddings --pooling mean -ngl 999 -c 2048 \
+  --host 127.0.0.1 --port 8080
+```
+
+`--embeddings` is mandatory or every request returns
+`501 This server does not support embeddings`.
+
+**Use the native `/embedding` endpoint, not `/v1/embeddings`.** The OpenAI-shaped
+endpoint rejects images outright (`"prompt" elements must be a string…`) — that
+error message is misleading, it looks like a malformed body but the endpoint
+simply has no image support. The native endpoint takes the image in a sibling
+field:
+
+```
+POST http://127.0.0.1:8080/embedding
+{"content": "<prompt text>", "image": "<base64 png>"}
+```
+
+Response is a list: `[{"index":0,"embedding":[[ ...768 floats... ]]}]` — note the
+extra batch nesting, which trips naive parsers.
+
+**Measured results** (Arc A530M, Vulkan1, 12 cores):
+
+| Input | Dims | Latency |
+|---|---|---|
+| Text query | 768 | 0.04 s |
+| Screenshot PNG | 768 | 0.40 s |
+
+**Shared-space sanity check.** Embedding a real screenshot region and comparing
+cosine similarity against three text probes:
+
+| Probe | Similarity |
+|---|---|
+| "a cropped screenshot of a computer screen" | **+0.9176** |
+| "a photograph of a cat outdoors" | +0.7602 |
+| "a spreadsheet of financial figures" | +0.7226 |
+
+The screenshot sits closest to the screenshot description and furthest from the
+cat, so image and text embeddings really do share one space. This is what makes
+"find that screenshot where…"-style search possible.
+
+**Throughput implication.** At 0.40 s/image the first backfill of 369 existing
+PNGs is roughly **2.5 minutes**. Indexing is cheap enough to do synchronously in
+a background task without hurting the machine.
+
+### Work slices
+
+- [x] **5.0 Spike R1 — embedding runtime. ANSWER: image embeddings WORK.**
+      Measured on the Arc A530M, 2026-10-10. See "Spike 5.0 findings" below.
+      **Gates 5.4 → unblocked.**
+- [x] **5.1 Schema.** Columns `ocr_text`, `ocr_boxes`, `embedded_at`,
+      `embed_model` (added idempotently via `PRAGMA table_info`, since
+      `ALTER TABLE ADD COLUMN` has no `IF NOT EXISTS` and the schema runs
+      against existing databases). FTS5 table `screenshots_fts` over `ocr_text`
+      using external content, kept in sync by three triggers. `vec0` table
+      `screenshot_vec` at `float[768]`. sqlite-vec is registered before any
+      connection opens. Both search tables are best-effort: a failure there
+      disables search rather than blocking capture, because the PNGs on disk are
+      the source of truth. Covered by `search_schema_is_complete_and_live`.
+- [x] 5.2 Async indexer (`src-tauri/src/indexer.rs`). Background task reads
+      rows where `ocr_text` is empty or `embedded_at` is NULL, runs tesseract and
+      the embedding server, and writes results. Never on the capture path —
+      `save_png` records the row and calls `indexer::poke()`, which only wakes
+      the worker. Verified end to end on a real screenshot: OCR extracted 299
+      words, embedding returned 768 dims, FTS matched the stored text and vec0
+      returned the right row.
+- [x] 5.3 OCR (`src-tauri/src/ocr.rs`). tesseract TSV output, which yields word
+      boxes and confidences for free; only level-5 rows are real words.
+- [x] 5.4 Embeddings (`src-tauri/src/embedder.rs`). The app now **spawns
+      llama-server itself**, waits for `/health`, and posts to the native
+      `/embedding`. If the server is unavailable the row is stamped `skipped`
+      so it is retried later rather than looping forever. Model runs on the Arc
+      via `GGML_VK_VISIBLE_DEVICES`.
+- [x] 5.5 FTS5 keyword search UI over `ocr_text`. **Sanitise the query**:
+      FTS5 treats `-`, `"`, `*`, `:` and `OR` as operators, so raw user input
+      will otherwise throw a syntax error. Quote each term or use a parser.
+      Done: `db::fts_query` splits on non-alphanumerics and wraps each term in
+      quotes (so nothing can be reinterpreted as an operator), joined with `OR`.
+      `search_text` command + Search tab, debounced 250ms. Verified against the
+      real corpus: `bookmarks` -> 1 hit, `error -debug` -> 3, `a:b*c` -> 3.
+- [x] 5.6 Progress surfacing so a long first backfill is visible and
+      interruptible rather than a silent freeze. Done: `index-progress` event
+      pushed after every batch plus a 4s poll, `index_status`/`index_pause`
+      commands. A small stateful chip, NOT a bar: at 1.4s/image a bar sits
+      empty or twitches, and the state is the useful signal. States are
+      Loading model / Reading text / Indexing N of M / Paused; it disappears
+      when caught up. Pause takes effect after the batch in flight finishes, so
+      no vector is ever half-written.
+
+Carry-over from earlier milestones (small, do them when convenient):
+- [ ] Verify active-window capture, global shortcuts, Cancel, notification, and
+      history thumbnails on real hardware.
+- [ ] Multi-monitor and HiDPI drag-overlay checks (needs a second display).
+- [ ] Region selection blackout: measured grab 324 ms + overlay page load.
+
+---
+
+## Milestone 6 — Search and answers
+
+- [ ] 6.1 Hybrid retrieval: FTS5 keyword results + sqlite-vec k-NN, fused into
+      one ranked list. Start with reciprocal rank fusion, not a tuned weighted
+      blend — it needs no score calibration.
+- [x] 6.2 Results UI: thumbnails, timestamps, dimensions, click to open. Done
+      via `ShotCard`/`ShotPreview` (`src/components/shot.tsx`), shared by the
+      history grid and search results.
+- [ ] 6.3 Voice input: push-to-talk, transcribe with Whistle (via
+      `cactus-needle`), drop the text into the search box.
+- [ ] 6.4 Answer synthesis: send the retrieved OCR snippets plus the question to an
+      under-2B Ollama model and have it cite screenshot ids.
+- [ ] 6.5 Reranking only if 6.1 results feel wrong in practice.
+
+---
+
+## Rules
+
+- Build and verify one slice at a time. Do not start 5.2 before the 5.0 spike
+  reports back.
+- Capture is never blocked by inference. Queue work; never `await` a model on
+  the capture path.
+- All inference local. No screenshot, query or audio leaves the machine.
+- Files are the source of truth. Losing the DB must never lose a PNG.
+- Prefer deletion: no scaffolding for a later slice.
+
+## Environment notes
+
+- MX Linux (Debian trixie base), XFCE, **X11**, `XDG_SESSION_TYPE=x11`.
+- **GPU: Intel Arc A530M present but NOT enabled.** Today only
+  `00:02.0 Alder Lake-S [UHD Graphics]` is enumerable; `vulkaninfo` reports that
+  iGPU plus llvmpipe. Enable it in BIOS, then re-check `vulkaninfo --summary`.
+- 12 cores, 7.6 GB RAM but only ~2.0 GB available, 6 GB swap + 7.5 GB zram.
+  Mesa 25.0.7 (cooperative matrix needs ≥26.1). No CUDA.
+- Installed and usable: `tesseract 5.5.0` (eng, osd), `ollama 0.34.0`, `uv`,
+  `python3`, `curl`, `gcc`, `vulkaninfo`/`vainfo`/`intel_gpu_top`. Not installed:
+  `llama-server`, `llama.cpp`, `intel-opencl-icd`.
+- `xcap` (successor to `screenshots`) needs `libpipewire-0.3-dev`, uninstallable
+  here (runtime 1.4.10 vs repo dev 1.4.5). Stay on `screenshots` until MX syncs.
+- `tauri = { version = "2" }` **must** stay in `[dependencies]`. Without it there is
+  no `links = "Tauri"` edge, cargo forwards no `DEP_TAURI_*`, and
+  `tauri_build::build()` fails with the misleading "missing `cargo:dev`
+  instruction, please update tauri to latest".
+- `typecheck` must be `tsc -b`; bare `tsc --noEmit` checks zero files because the
+  root tsconfig is a solution file.
+- `src-tauri/gen/schemas/` regenerates on each successful build, so new plugin
+  permissions only become editor-valid after a build succeeds.
