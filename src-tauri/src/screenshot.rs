@@ -44,7 +44,30 @@ pub(crate) fn ensure_dir(dir: &Path) -> Result<(), String> {
 }
 
 fn timestamp() -> String {
-    Local::now().format("%Y-%m-%d-%H-%M-%S").to_string()
+    // Millisecond precision: delay defaults to 0, so nothing throttles rapid
+    // captures and whole-second names collide on their own.
+    Local::now().format("%Y-%m-%d-%H-%M-%S-%3f").to_string()
+}
+
+/// Claim a free filename, suffixing `-2`, `-3`, … if needed. `create_new`
+/// reserves atomically rather than probing with `exists()`, so two captures
+/// racing on one stem cannot both pick the same name and lose a screenshot.
+fn unique_path(dir: &Path, base: &str) -> Result<PathBuf, String> {
+    let (stem, ext) = base.rsplit_once('.').unwrap_or((base, ""));
+    for n in 1.. {
+        let candidate = if n == 1 {
+            base.to_string()
+        } else {
+            format!("{stem}-{n}.{ext}")
+        };
+        let path = dir.join(candidate);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Could not create {}: {e}", path.display())),
+        }
+    }
+    unreachable!("loop only ends by returning or erroring")
 }
 
 fn sanitize(name: &str) -> String {
@@ -95,8 +118,8 @@ fn capture_virtual_rect(
 }
 
 pub(crate) fn save_png(image: screenshots::image::RgbaImage, dir: &Path, stem: &str) -> Result<String, String> {
-    let filename = format!("xreenshoty-{}-{}.png", timestamp(), sanitize(stem));
-    let path = dir.join(filename);
+    let base = format!("xreenshoty-{}-{}.png", timestamp(), sanitize(stem));
+    let path = unique_path(dir, &base)?;
     let (width, height) = (image.width(), image.height());
     image
         .save(&path)
@@ -310,6 +333,21 @@ pub fn capture_active_window(save_dir: Option<String>) -> Result<String, String>
     save_png(image, &dir, "active-window")
 }
 
+/// Delete a screenshot: the PNG on disk and its search index entry.
+///
+/// The row is removed first and the file second, so a failed database write
+/// leaves the picture intact rather than orphaning it.
+#[tauri::command]
+pub async fn delete_screenshot(path: String) -> Result<(), String> {
+    let clean = crate::db::forget(&path)?;
+    let p = std::path::PathBuf::from(&clean);
+    if p.is_file() {
+        std::fs::remove_file(&p).map_err(|e| format!("Could not delete {}: {e}", p.display()))?;
+        log::info!("deleted {}", p.display());
+    }
+    Ok(())
+}
+
 /// Hand a screenshot to the system image viewer.
 ///
 /// Uses the same xdg-open path as `open_folder`, so whatever the user already
@@ -443,6 +481,33 @@ pub async fn thumbnail(path: String, size: Option<u32>) -> Result<String, String
 #[cfg(test)]
 mod thumbnail_tests {
     use super::*;
+
+    #[test]
+    fn unique_path_suffixes_on_collision() {
+        let dir = std::env::temp_dir().join("xreenshoty-unique-path-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = unique_path(&dir, "xreenshoty-test-shot.png").unwrap();
+        assert!(first.exists());
+        assert_eq!(
+            first.file_name().unwrap().to_str().unwrap(),
+            "xreenshoty-test-shot.png"
+        );
+
+        // A second claim on the same stem must not reuse the first path.
+        let second = unique_path(&dir, "xreenshoty-test-shot.png").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            second.file_name().unwrap().to_str().unwrap(),
+            "xreenshoty-test-shot-2.png"
+        );
+
+        let third = unique_path(&dir, "xreenshoty-test-shot.png").unwrap();
+        assert_ne!(second, third);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn cache_key_is_stable_and_distinguishes_inputs() {

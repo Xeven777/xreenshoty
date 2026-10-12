@@ -54,7 +54,7 @@ export function IndexIndicator() {
     // The indexer also pushes after every batch, so a backfill shows progress
     // immediately instead of lagging up to one poll interval behind.
     const un = listen<IndexStatus>("index-progress", (e) =>
-      setStatus(e.payload),
+      setStatus(e.payload)
     )
     return () => {
       clearInterval(poll)
@@ -83,7 +83,9 @@ export function IndexIndicator() {
         size={12}
         weight="fill"
         className={
-          paused ? "shrink-0 text-muted-foreground" : "shrink-0 animate-pulse text-primary"
+          paused
+            ? "shrink-0 text-muted-foreground"
+            : "shrink-0 animate-pulse text-primary"
         }
       />
       <span className="text-muted-foreground">

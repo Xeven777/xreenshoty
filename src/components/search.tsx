@@ -1,183 +1,436 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { isTauri } from "@tauri-apps/api/core"
 import {
   Eye,
-  Image as ImageIcon,
+  ImageIcon,
   MagnifyingGlass,
+  Microphone,
+  MicrophoneSlash,
   SpinnerGap,
+  Stack,
   TextAa,
+  XIcon,
 } from "@phosphor-icons/react"
+import { AnimatePresence, motion } from "motion/react"
 
 import { Badge } from "@/components/ui/badge"
-import { ShotCard, ShotPreview, usePreview } from "@/components/shot"
-import { Button } from "@/components/ui/button"
+import { dirOf, ShotCard, ShotPreview, usePreview } from "@/components/shot"
 import { Input } from "@/components/ui/input"
 import {
   openFolder,
+  searchHybrid,
   searchSimilar,
   searchText,
-  type Screenshot,
+  voiceCancel,
+  voiceStart,
+  voiceStop,
+  type SearchHit,
 } from "@/lib/screenshot"
 import { useThumbnails } from "@/lib/use-thumbnails"
 
-const DEBOUNCE_MS = 250
-type Mode = "text" | "visual"
+const DEBOUNCE_MS = 350
+const LIMIT = 60
 
-export function Search({ saveDir }: { saveDir: string | null }) {
+const MODES = [
+  {
+    id: "combined",
+    label: "Combined",
+    icon: Stack,
+    blurb:
+      "Matches the text a screenshot contains and what it looks like, ranked by agreement between the two.",
+    placeholder: "e.g. permission denied, a terminal full of red errors",
+    empty: "Try “login screen”, “bookmarks”, “red error dialog”…",
+  },
+  {
+    id: "ocr",
+    label: "OCR",
+    icon: TextAa,
+    blurb:
+      "Matches the words a screenshot contains. Best for exact names, error codes and file paths.",
+    placeholder: "e.g. permission denied, NFTS, ECONNREFUSED",
+    empty: "Only screenshots with readable text can match here.",
+  },
+  {
+    id: "visual",
+    label: "Visual",
+    icon: Eye,
+    blurb:
+      "Describes what a screenshot looks like. Finds images with no readable text at all.",
+    placeholder: "e.g. a terminal full of red errors",
+    empty: "Try “login screen”, “chart going up”, “red error dialog”…",
+  },
+] as const
+
+type Mode = (typeof MODES)[number]["id"]
+
+function VoiceButton({ onText }: { onText: (t: string) => void }) {
+  const [state, setState] = useState<"idle" | "recording" | "working">("idle")
+  const [error, setError] = useState<string | null>(null)
+  const stateRef = useRef(state)
+  useEffect(() => {
+    stateRef.current = state
+  }, [state])
+
+  async function toggle() {
+    if (stateRef.current === "working") return
+    if (stateRef.current === "recording") {
+      setState("working")
+      try {
+        const text = (await voiceStop()).trim()
+        if (text) onText(text)
+        else setError("Heard nothing — try again closer to the mic.")
+      } catch (err) {
+        setError(String(err))
+      }
+      setState("idle")
+      return
+    }
+    setError(null)
+    try {
+      await voiceStart()
+      setState("recording")
+    } catch (err) {
+      setError(String(err))
+    }
+  }
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape" && stateRef.current === "recording") {
+        void voiceCancel().catch(() => undefined)
+        setState("idle")
+      }
+    }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [])
+
+  const recording = state === "recording"
+
+  return (
+    <>
+      <motion.button
+        type="button"
+        title={
+          recording
+            ? "Tap to stop and search"
+            : "Tap to talk, tap again to search"
+        }
+        aria-label="Voice search"
+        aria-pressed={recording}
+        onClick={() => void toggle()}
+        whileTap={{ scale: 0.88 }}
+        animate={recording ? { scale: [1, 1.12, 1] } : { scale: 1 }}
+        transition={
+          recording
+            ? { duration: 1.4, repeat: Infinity, ease: "easeInOut" }
+            : { type: "spring", stiffness: 500, damping: 22 }
+        }
+        className={`relative grid size-9 place-items-center rounded-full transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring/40 ${
+          recording
+            ? "text-destructive-foreground bg-destructive shadow-lg"
+            : "bg-brand text-primary-foreground shadow-brand hover:opacity-90"
+        }`}
+      >
+        {recording ? (
+          <span className="absolute inset-0 animate-ping rounded-full bg-destructive/40" />
+        ) : null}
+        {state === "working" ? (
+          <SpinnerGap size={17} className="animate-spin" />
+        ) : recording ? (
+          <MicrophoneSlash size={17} weight="fill" />
+        ) : (
+          <Microphone size={17} weight="fill" />
+        )}
+      </motion.button>
+      <AnimatePresence>
+        {error ? (
+          <motion.span
+            initial={{ opacity: 0, y: -4 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -4 }}
+            transition={{ duration: 0.18 }}
+            className="absolute top-full right-0 z-10 mt-1 max-w-55 rounded-lg border bg-card p-2 text-xs text-destructive shadow-lg"
+          >
+            {error}
+          </motion.span>
+        ) : null}
+      </AnimatePresence>
+      <AnimatePresence>
+        {recording ? (
+          <motion.span
+            initial={{ opacity: 0, x: 6 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: 6 }}
+            transition={{ duration: 0.2 }}
+            className="mr-1 hidden text-xs font-medium text-destructive sm:block"
+          >
+            Listening…
+          </motion.span>
+        ) : null}
+      </AnimatePresence>
+    </>
+  )
+}
+
+function runSearch(mode: Mode, query: string): Promise<SearchHit[]> {
+  if (mode === "ocr") return searchText(query, LIMIT)
+  if (mode === "visual") return searchSimilar(query, LIMIT)
+  return searchHybrid(query, LIMIT)
+}
+
+export function Search() {
   const tauri = useMemo(() => isTauri(), [])
   const preview = usePreview()
   const [query, setQuery] = useState("")
-  const [mode, setMode] = useState<Mode>("text")
-  const [visualError, setVisualError] = useState<string | null>(null)
+  const [mode, setMode] = useState<Mode>("combined")
   const [settled, setSettled] = useState("")
-  const [results, setResults] = useState<Screenshot[]>([])
-  const [error, setError] = useState<string | null>(null)
+  const [results, setResults] = useState<SearchHit[]>([])
+  const [elapsed, setElapsed] = useState(0)
+  const [failure, setFailure] = useState<{ key: string; msg: string } | null>(
+    null
+  )
+  const seq = useRef(0)
 
   const term = query.trim()
-  // Derived rather than stored: a new keystroke must not leave the previous
-  // term's results on screen, and "searching" covers both the debounce wait
-  // and the in-flight request.
-  const searching = tauri && term.length > 0 && term !== settled
-  const searched = tauri && term.length > 0 && term === settled
-  const shown = useMemo(() => (searched ? results : []), [searched, results])
+  const key = `${mode}:${term}`
+  const active = MODES.find((m) => m.id === mode)!
+  const searching = tauri && term.length > 0 && key !== settled
+  const searched = tauri && term.length > 0 && key === settled
+  const failed = searched && failure?.key === key
+  const shown = useMemo(
+    () => (searched && !failed ? results : []),
+    [searched, failed, results]
+  )
+  const scoreByPath = useMemo(
+    () => new Map(results.map((r) => [r.path, r])),
+    [results]
+  )
 
   const thumbs = useThumbnails(useMemo(() => shown.map((r) => r.path), [shown]))
 
   useEffect(() => {
     if (!tauri || term.length === 0) return
 
-    let cancelled = false
+    const n = ++seq.current
+    const k = key
+    const t = term
+    const m = mode
     const timer = setTimeout(async () => {
+      const started = performance.now()
       try {
-        let found: Screenshot[]
-        if (mode === "visual") {
-          found = await searchSimilar(term, 60)
-          if (cancelled) return
-          setVisualError(null)
-        } else {
-          found = await searchText(term, 60)
-          if (cancelled) return
-        }
+        const found = await runSearch(m, t)
+        if (seq.current !== n) return
         setResults(found)
-        setError(null)
+        setFailure(null)
+        setElapsed(Math.max(1, Math.round(performance.now() - started)))
       } catch (e) {
-        if (cancelled) return
-        const msg = String(e)
-        if (mode === "visual") setVisualError(msg)
-        else setError(msg)
+        if (seq.current !== n) return
+        setFailure({ key: k, msg: String(e) })
       } finally {
-        if (!cancelled) setSettled(term)
+        if (seq.current === n) setSettled(k)
       }
     }, DEBOUNCE_MS)
 
     return () => {
-      cancelled = true
       clearTimeout(timer)
     }
-  }, [term, mode, tauri])
+  }, [term, mode, key, tauri])
+
+  async function searchNow() {
+    if (!tauri || term.length === 0) return
+    const n = ++seq.current
+    const k = key
+    const t = term
+    const started = performance.now()
+    try {
+      const found = await runSearch(mode, t)
+      if (seq.current !== n) return
+      setResults(found)
+      setFailure(null)
+      setElapsed(Math.max(1, Math.round(performance.now() - started)))
+    } catch (e) {
+      if (seq.current !== n) return
+      setFailure({ key: k, msg: String(e) })
+    } finally {
+      if (seq.current === n) setSettled(k)
+    }
+  }
 
   return (
     <div className="space-y-4">
       <section className="space-y-4 rounded-2xl border bg-card p-5 shadow-sm">
-        <header>
-          <h2 className="font-medium">Search screenshots</h2>
-          <p className="text-xs text-muted-foreground">
-            Matches any text a screenshot contains. Multiple words widen the
-            search.
-          </p>
+        <header className="flex flex-wrap items-end justify-between gap-3">
+          <div className="min-w-0">
+            <h2 className="font-medium">Search screenshots</h2>
+            <p className="text-xs text-muted-foreground">{active.blurb}</p>
+          </div>
+          <div
+            role="group"
+            aria-label="Search mode"
+            className="flex rounded-full bg-muted p-1"
+          >
+            {MODES.map((opt) => (
+              <button
+                key={opt.id}
+                type="button"
+                aria-pressed={mode === opt.id}
+                title={opt.blurb}
+                onClick={() => setMode(opt.id)}
+                className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-colors duration-150 outline-none focus-visible:ring-2 focus-visible:ring-ring/40 ${
+                  mode === opt.id
+                    ? "bg-card text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <opt.icon size={14} data-icon="inline-start" />
+                {opt.label}
+              </button>
+            ))}
+          </div>
         </header>
-
-        <div className="flex gap-2">
-          <Button
-            size="xs"
-            variant={mode === "text" ? "default" : "ghost"}
-            onClick={() => setMode("text")}
-          >
-            <TextAa data-icon="inline-start" />
-            Words
-          </Button>
-          <Button
-            size="xs"
-            variant={mode === "visual" ? "default" : "ghost"}
-            onClick={() => setMode("visual")}
-          >
-            <Eye data-icon="inline-start" />
-            What&apos;s in the picture
-          </Button>
-          {mode === "visual" ? (
-            <span className="self-center text-xs text-muted-foreground">
-              needs the embedding model
-            </span>
-          ) : null}
-        </div>
 
         <div className="relative">
           <MagnifyingGlass
             size={16}
-            className="pointer-events-none absolute top-1/2 left-3 -translate-y-1/2 text-muted-foreground"
+            className="pointer-events-none absolute top-1/2 left-3.5 -translate-y-1/2 text-muted-foreground"
           />
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="e.g. permission denied, bookmarks, error"
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault()
+                void searchNow()
+              } else if (e.key === "Escape" && query) {
+                setQuery("")
+              }
+            }}
+            placeholder={active.placeholder}
             disabled={!tauri}
-            className="pl-9 pr-9"
+            aria-label="Search screenshots"
+            className="h-11 pr-24 pl-10 text-[15px] shadow-sm"
           />
-          {searching ? (
-            <SpinnerGap
-              size={16}
-              className="animate-spin absolute top-1/2 right-3 -translate-y-1/2 text-muted-foreground"
-            />
-          ) : null}
+          <span className="absolute top-1/2 right-3 flex -translate-y-1/2 items-center gap-1">
+            <VoiceButton onText={(t) => setQuery(t)} />
+            {searching ? (
+              <SpinnerGap
+                size={16}
+                className="animate-spin text-muted-foreground"
+              />
+            ) : query ? (
+              <button
+                type="button"
+                title="Clear (Esc)"
+                aria-label="Clear search"
+                onClick={() => setQuery("")}
+                className="grid size-6 place-items-center rounded-full text-muted-foreground transition-colors outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40"
+              >
+                <XIcon size={14} />
+              </button>
+            ) : (
+              <kbd className="hidden rounded-md border bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground sm:block">
+                ⏎
+              </kbd>
+            )}
+          </span>
         </div>
 
-        {visualError ? (
+        {failed ? (
           <p className="rounded-xl bg-destructive/10 p-3 text-sm text-destructive">
-            Visual search is unavailable: {visualError}
+            {failure.msg}
           </p>
         ) : null}
 
-        {error ? (
-          <p className="rounded-xl bg-destructive/10 p-3 text-sm text-destructive">
-            {error}
-          </p>
-        ) : null}
-
-        {searched ? (
+        {searched && !failed ? (
           <div className="flex items-center gap-2">
             <Badge variant="secondary">{shown.length}</Badge>
             <span className="text-xs text-muted-foreground">
               {shown.length === 1 ? "screenshot" : "screenshots"} matching
+              {mode === "combined" ? "text + appearance · " : ""}
+              {elapsed} ms
             </span>
           </div>
         ) : null}
       </section>
 
-      {shown.length === 0 ? (
+      {searching && shown.length === 0 ? (
+        <div
+          aria-label="Searching"
+          className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4"
+        >
+          {Array.from({ length: 8 }).map((_, i) => (
+            <div key={i} className="overflow-hidden rounded-2xl border bg-card">
+              <div className="aspect-video animate-pulse bg-muted" />
+              <div className="space-y-1.5 p-2.5">
+                <div className="h-3 w-2/3 animate-pulse rounded bg-muted" />
+                <div className="h-2.5 w-1/2 animate-pulse rounded bg-muted" />
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : shown.length === 0 ? (
         <div className="flex items-center gap-3 rounded-2xl border bg-card p-6 text-sm text-muted-foreground">
-          <ImageIcon size={20} />
-          {searched
-            ? "Nothing matched. Try fewer or more common words."
-            : "Type a word to search the text inside your screenshots."}
+          <ImageIcon size={20} className="shrink-0" />
+          <div>
+            <p className="font-medium text-foreground">
+              {failed
+                ? "Search failed"
+                : searched
+                  ? "Nothing matched"
+                  : "Search words or describe a screenshot"}
+            </p>
+            <p className="text-xs">
+              {failed
+                ? "See the message above."
+                : searched
+                  ? "Try fewer or more common words."
+                  : "Try “login screen”, “bookmarks”, “red error dialog”…"}
+            </p>
+          </div>
         </div>
       ) : (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-          {shown.map((item) => (
-            <ShotCard
-              key={item.path}
-              item={item}
-              thumb={thumbs[item.path]}
-              onOpen={preview.show}
-              onOpenFolder={() => openFolder(saveDir).catch(() => undefined)}
-            />
+          {shown.map((item, i) => (
+            <div
+              key={`${settled}:${item.path}`}
+              className="animate-rise"
+              style={{ animationDelay: `${Math.min(i, 11) * 35}ms` }}
+            >
+              <ShotCard
+                item={item}
+                thumb={thumbs[item.path]}
+                snippet={mode === "visual" ? null : item.snippet}
+                score={mode === "ocr" ? null : item.score}
+                scoreZ={mode === "ocr" ? null : item.score_z}
+                onOpen={preview.show}
+                onOpenFolder={() =>
+                  openFolder(dirOf(item.path)).catch(() => undefined)
+                }
+              />
+            </div>
           ))}
         </div>
       )}
 
       <ShotPreview
         item={preview.item}
+        score={
+          preview.item
+            ? (scoreByPath.get(preview.item.path)?.score ?? null)
+            : null
+        }
+        scoreZ={
+          preview.item
+            ? (scoreByPath.get(preview.item.path)?.score_z ?? null)
+            : null
+        }
         onClose={preview.hide}
-        onOpenFolder={() => openFolder(saveDir).catch(() => undefined)}
+        onOpenFolder={
+          preview.item
+            ? () => openFolder(dirOf(preview.item!.path)).catch(() => undefined)
+            : undefined
+        }
       />
     </div>
   )

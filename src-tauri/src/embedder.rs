@@ -248,6 +248,21 @@ impl Embedder {
         false
     }
 
+    /// Kills the server we spawned, if we spawned one. Idempotent.
+    ///
+    /// Called explicitly on shutdown: `child` is held behind a process-lifetime
+    /// `OnceLock<Arc<Embedder>>`, so the last `Arc` never drops and `Drop`
+    /// alone would never run. `child` is only ever `Some` when *we* spawned it,
+    /// so a reused server is never killed.
+    pub fn shutdown(&self) {
+        let mut lock = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut child) = lock.take() {
+            log::info!("embedding: stopping llama-server (pid {})", child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
     /// Embed a batch of inputs against `/v1/embeddings`.
     ///
     /// Images **only** work on this endpoint, and only in the wrapped OpenAI
@@ -311,6 +326,17 @@ impl Embedder {
     }
 }
 
+/// Backstop for the normal case. Shutdown calls `shutdown()` explicitly
+/// because the `Arc` lives in a `OnceLock` and so never drops, but if that
+/// ref is ever released this makes sure the child cannot outlive the embedder.
+/// Rust does not reap or terminate children on drop, so an ~825 MB model plus
+/// its GPU allocation would otherwise stay resident after the app quits.
+impl Drop for Embedder {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// One image input for `/v1/embeddings`.
 ///
 /// The `{"content": [...]}` wrapper is load-bearing: a bare content array is
@@ -353,6 +379,41 @@ fn dir_config_log() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BH3: the spawned server must not outlive the app.
+///
+/// What distinguishes a working `kill()` from a missing one is *timing*: with
+/// the kill, `wait()` reaps the child immediately; without it, `wait()` blocks
+/// until the child exits on its own. So the assertion is that shutdown returns
+/// well before the stand-in's own lifetime, not merely that the pid is gone --
+/// a plain pid check passes either way, just 20s later.
+#[test]
+    fn shutdown_kills_the_server_we_spawned() {
+        let embedder = Embedder::new(Config::discover());
+        let child = Command::new("sleep").arg("20").spawn().unwrap();
+        let pid = child.id();
+        *embedder.child.lock().unwrap() = Some(child);
+
+        let started = std::time::Instant::now();
+        embedder.shutdown();
+        let took = started.elapsed();
+
+        assert!(
+            took < Duration::from_secs(5),
+            "pid {pid} survived: shutdown waited {took:?} instead of killing it"
+        );
+        // Idempotent: a second call must not panic on the now-empty slot.
+        embedder.shutdown();
+    }
+
+    /// A server we did not spawn is not ours to kill.
+    #[test]
+    fn shutdown_leaves_an_unspawned_embedder_alone() {
+        let embedder = Embedder::new(Config::discover());
+        // No child stored at all -- the reuse path. Must be a no-op.
+        embedder.shutdown();
+        assert!(embedder.child.lock().unwrap().is_none());
+    }
 
     #[test]
     fn f32_bytes_round_trip() {

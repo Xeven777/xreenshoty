@@ -8,6 +8,7 @@ mod indexer;
 mod ocr;
 mod region;
 mod screenshot;
+mod voice;
 
 fn external_navigation_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
     tauri::plugin::Builder::<R>::new("external-navigation")
@@ -38,7 +39,7 @@ fn external_navigation_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(region::Backdrop::default())
         .plugin(
             tauri_plugin_log::Builder::new()
@@ -73,6 +74,7 @@ pub fn run() {
             screenshot::capture_fullscreen,
             screenshot::capture_region,
             screenshot::capture_active_window,
+            screenshot::delete_screenshot,
             screenshot::open_file,
             screenshot::open_folder,
             screenshot::thumbnail,
@@ -83,11 +85,16 @@ pub fn run() {
             region::save_region_from_backdrop,
             db::list_recent,
             db::import_existing,
+            db::search_hybrid,
             db::search_similar,
             indexer::index_pause,
             indexer::index_status,
             db::search_text,
-            db::screenshot_count
+            db::screenshot_detail,
+            db::screenshot_count,
+            voice::voice_start,
+            voice::voice_stop,
+            voice::voice_cancel
         ])
         .on_page_load(|webview, payload| {
             if webview.label() == "main" && matches!(payload.event(), PageLoadEvent::Finished) {
@@ -95,6 +102,19 @@ pub fn run() {
                 let _ = webview.window().show();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    // Kill the llama-server this process spawned so an ~825 MB model is never
+    // left resident. Hooked to `RunEvent::Exit` as well as the return path,
+    // because a window closed by the WM can end the process without the
+    // builder's closure ever running, and an orphaned server holds the port and
+    // ~825 MB of GPU/CPU memory.
+    app.run(|_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            indexer::shutdown();
+        }
+    });
+
+    indexer::shutdown();
 }

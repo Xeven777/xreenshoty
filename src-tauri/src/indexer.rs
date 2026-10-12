@@ -49,10 +49,29 @@ fn indexer() -> Option<Arc<Indexer>> {
     INDEXER.get().cloned()
 }
 
+/// Install an embedder for tests. The real one is created by `Indexer::start`
+/// when the app boots, which a unit test never does.
+#[cfg(test)]
+pub fn install_test_embedder(e: Arc<Embedder>) {
+    let _ = EMBEDDER.set(e);
+}
+
 /// The embedder owned by the running indexer, so search commands can reach it
 /// without every one of them having to thread an `AppHandle` through.
 pub fn embedder() -> Option<Arc<Embedder>> {
     EMBEDDER.get().cloned()
+}
+
+/// Kill the embedding server this process spawned, at app exit.
+///
+/// The `Embedder` is held by a process-lifetime `OnceLock`, so the last `Arc`
+/// never drops and `Drop` would never fire. Called after
+/// `tauri::Builder::run` returns, the one point guaranteed to happen exactly
+/// once at shutdown.
+pub fn shutdown() {
+    if let Some(embedder) = embedder() {
+        embedder.shutdown();
+    }
 }
 
 /// Snapshot for the UI. `paused` is read here rather than tracked separately so
@@ -74,7 +93,9 @@ pub async fn index_status() -> Result<IndexStatus, String> {
         embedded: p.embedded,
         ocred: p.ocred,
         total: p.total,
-        paused: idx.as_ref().is_some_and(|i| i.paused.load(Ordering::Relaxed)),
+        paused: idx
+            .as_ref()
+            .is_some_and(|i| i.paused.load(Ordering::Relaxed)),
         server_ready: idx.as_ref().is_some_and(|i| i.embedder.is_ready()),
     })
 }
@@ -85,6 +106,9 @@ pub async fn index_status() -> Result<IndexStatus, String> {
 pub async fn index_pause(paused: bool) -> Result<(), String> {
     let idx = indexer().ok_or("indexer not running")?;
     idx.paused.store(paused, Ordering::Relaxed);
+    // Without this the worker stays parked in `select!` until IDLE_POLL expires,
+    // so a resume took up to 20s to be noticed.
+    idx.wake.notify_one();
     log::info!("indexer: {}", if paused { "paused" } else { "resumed" });
     Ok(())
 }
@@ -117,7 +141,10 @@ impl Indexer {
             log::warn!("embedding server not started ({e}); semantic search will retry");
         } else {
             let warm = embedder.clone();
-            tauri::async_runtime::spawn(async move {
+            // spawn_blocking, not spawn: `wait_ready` is a synchronous poll with
+            // `thread::sleep` in it, so on the async pool it would hold a runtime
+            // worker for up to five minutes.
+            tauri::async_runtime::spawn_blocking(move || {
                 if warm.wait_ready(Duration::from_secs(300)) {
                     log::info!("embedding server ready");
                 } else {
@@ -198,26 +225,44 @@ impl Indexer {
                         .collect();
                     handles
                         .into_iter()
-                        .map(|h| h.join().unwrap_or_else(|_| Err("OCR thread panicked".into())))
+                        .map(|h| {
+                            h.join()
+                                .unwrap_or_else(|_| Err("OCR thread panicked".into()))
+                        })
                         .collect()
                 });
 
                 for (row, outcome) in chunk.iter().zip(results) {
                     match outcome {
                         Ok(result) => {
-                            let words =
-                                serde_json::to_string(&result.words).unwrap_or_else(|_| "[]".into());
+                            let words = serde_json::to_string(&result.words)
+                                .unwrap_or_else(|_| "[]".into());
                             match db::set_ocr(row.id, &result.text, &words) {
-                                Ok(()) if !result.text.is_empty() => {
+                                // Any successful `set_ocr` is progress, including
+                                // the empty-text case: `ocr_boxes` is written
+                                // either way, so the row will not be offered
+                                // again. Counting only non-empty text meant a
+                                // batch of text-free screenshots reported no
+                                // progress and stalled the chain.
+                                Ok(()) => {
                                     touched.insert(row.id);
                                 }
-                                Ok(()) => {}
                                 Err(e) => {
                                     log::warn!("indexer: storing OCR for {} failed: {e}", row.path)
                                 }
                             }
                         }
-                        Err(e) => log::warn!("indexer: OCR failed for {}: {e}", row.path),
+                        Err(e) => {
+                            log::warn!("indexer: OCR failed for {}: {e}", row.path);
+                            // Mark attempted even on failure. `pending()` keys
+                            // off `ocr_boxes`, so leaving it NULL would re-OCR a
+                            // hopeless image forever — paying the full timeout
+                            // again on every idle poll, which is the stall this
+                            // is guarding against. A timed-out screenshot does
+                            // lose its text; the timeout is set well above the
+                            // real cost precisely so that stays rare.
+                            let _ = db::set_ocr(row.id, "", "[]");
+                        }
                     }
                 }
             }
@@ -301,11 +346,7 @@ impl Indexer {
                 vector.len()
             ));
         }
-        db::set_embedding(
-            row.id,
-            &crate::embedder::to_f32_bytes(&vector),
-            label,
-        )
+        db::set_embedding(row.id, &crate::embedder::to_f32_bytes(&vector), label)
     }
 }
 

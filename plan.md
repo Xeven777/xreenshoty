@@ -4,7 +4,8 @@
 Local-first screenshot capture and later retrieval, fully offline. Match XFCE
 Screenshot behaviour for capture first; only then add local models for search.
 
-Status: Milestones 1–4 and 5.0-5.6 implemented. Next is Milestone 6 (hybrid retrieval).
+Status: Milestones 1–4, 5.0-5.6 and 6.1-6.3 implemented. Remaining:
+6.4 answer synthesis, 6.5 rerank if needed.
 
 ## Stack
 
@@ -19,7 +20,7 @@ Status: Milestones 1–4 and 5.0-5.6 implemented. Next is Milestone 6 (hybrid re
 | Embeddings | **EmbeddingGemma 2**, image → 768-d | Served by llama.cpp, Vulkan backend |
 | Vector store | **sqlite-vec** (`vec0` virtual table) | Replaces LanceDB |
 | Speech-to-text | **Whistle** 16.9 MB via `cactus-needle` | Replaces Phonon-2 |
-| Answer model | **already in Ollama**: `LFM2.5-1.2B`, `gemma3:1b` | No new download needed |
+| Answer model | **already in Ollama**: `LFM2.5-1.2B`, `gemma3:1b` — no new download needed. For 6.4, prefer serving the answer model from our own `llama-server` binary on demand (second port, shut down after) over adding an Ollama dependency: same GGUF runtime without a second resident daemon, and the embedder only holds the GPU for ~1-2 s per query so sequential use avoids contention |
 
 All inference is local. Nothing leaves the machine.
 
@@ -262,17 +263,88 @@ Carry-over from earlier milestones (small, do them when convenient):
 
 ## Milestone 6 — Search and answers
 
-- [ ] 6.1 Hybrid retrieval: FTS5 keyword results + sqlite-vec k-NN, fused into
-      one ranked list. Start with reciprocal rank fusion, not a tuned weighted
-      blend — it needs no score calibration.
+- [x] 6.1 Hybrid retrieval. Done: `search_hybrid` runs BM25 over OCR text and
+      k-NN over image vectors and blends them **weighted**, 0.44 OCR / 0.56
+      visual. Each arm is min-max rescaled first (best 1.0, worst 0.0) because
+      BM25 runs 0..30 and cosine distance 0..1 and cannot be added raw. A doc
+      missing from one arm takes that arm's floor, not zero, or the 74 text-free
+      screenshots become unfindable. Degrades to keyword-only when the model is
+      loading or unavailable. Three modes in the UI: Combined (default), OCR,
+      Visual. Verified on the real corpus: "permission denied" returns 0 keyword
+      hits but 5 hybrid; "error" and "login screen" rank differently under
+      weighted fusion than under RRF.
+      Weights are tunable without a rebuild:
+      `XREENSHOTY_FUSION_WEIGHTS="0.56,0.44"` flips the lean, and
+      `XREENSHOTY_FUSION=rrf` A/Bs against the old rank-only strategy, which
+      `rrf_fuse` still implements. The 0.44/0.56 split is a stated preference,
+      **not a measured optimum** — no relevance labels exist yet. Grounding:
+      arXiv 2210.11934 finds normalised convex combination beats RRF, and RRF
+      cannot distinguish a rank-1 that matched overwhelmingly from one that
+      barely matched.
+
 - [x] 6.2 Results UI: thumbnails, timestamps, dimensions, click to open. Done
       via `ShotCard`/`ShotPreview` (`src/components/shot.tsx`), shared by the
       history grid and search results.
-- [ ] 6.3 Voice input: push-to-talk, transcribe with Whistle (via
-      `cactus-needle`), drop the text into the search box.
-- [ ] 6.4 Answer synthesis: send the retrieved OCR snippets plus the question to an
-      under-2B Ollama model and have it cite screenshot ids.
-- [ ] 6.5 Reranking only if 6.1 results feel wrong in practice.
+- [x] 6.3 Voice input: push-to-talk, transcribe with Whistle (via
+      `cactus-needle`), drop the text into the search box. Done via
+      `src-tauri/src/voice.rs` (`voice_start`/`voice_stop`/`voice_cancel`) and
+      `VoiceButton` in `src/components/search.tsx`. Recorder is `pw-record`
+      16 kHz mono, `arecord` fallback; stop uses SIGTERM so the WAV header
+      flushes. Transcriber is the `voice-env` venv python, offline
+      (`HF_HUB_OFFLINE=1`), weights cached in `~/.cache`.
+- [ ] 6.4 Answer synthesis: send retrieved OCR snippets plus the question to a
+      small local model that cites screenshot ids. Researched candidate:
+      **OCC-RAG** (`occ-ai/OCC-RAG-0.6B` / `1.7B`, Qwen3 base, mid-trained for
+      faithful grounded QA). Emits `ANSWERABLE`/`UNANSWERABLE` and cites source
+      ids natively -- abstaining matters here, because "I have no screenshot of
+      that" is a correct answer. Beats gemma-3-4b-it on TAT-QA F1 (81.0 vs
+      65.3) and ConFiQA faithfulness (81.4 vs 69.8) at 1.7B. GGUF Q4_K_M is
+      1.11 GB. SERVING NOTE (not a second resident model by default): the
+      embedder only holds the GPU for ~1-2 s per search query (plus backfill
+      batches), so the answer model can be served from the same `llama-server`
+      binary on a second port on demand and shut down after -- sequential, not
+      concurrent. Ollama already has 1B models pulled and would work for a
+      prototype, but it is itself a llama.cpp wrapper plus a resident daemon;
+      shelling to our own binary avoids a new dependency and a second always-on
+      process. Do not run both models resident side-by-side on the 4 GB Arc.
+      FINDINGS (2026-10-12): three candidate LLM jobs evaluated against what
+      `search_hybrid` actually returns today (up to 60 hits of
+      `{path, created_at, snippet ~24 tokens, score}`; the LLM never sees
+      pixels unless a vision model is bought):
+      1. Answer synthesis (retrieve -> read -> reply): top 5-8 hits + question
+         -> 2-4 sentences with screenshot-id cites, or UNANSWERABLE. Turns "5
+         thumbnails to squint at" into a direct answer; abstention is the
+         killer feature since "nothing matched" and "wrong match" look
+         identical in a grid. ~2-5 s per explicit Ask click. Risk: 1B models
+         hallucinate citations, which is what OCC-RAG is for.
+      2. Query understanding (rewrite before retrieval): "red error dialog
+         yesterday" -> `{keywords, visual description, date_filter}` split
+         across the BM25 / vector arms. Fixes vague descriptions and mixed
+         queries, but must be an explicit "enhance" button, never on the
+         250 ms live debounce; marginal at 370 rows.
+      3. Per-image captions (enrich once, search forever): a VLM describes each
+         PNG once into a new indexed `caption` column, fixing the 74 text-free
+         screenshots at the root. By far the most expensive: needs a 2-4 GB+
+         vision model (not the 1B text models, not EmbeddingGemma), 30-90 min
+         backfill on the Arc, plus migration + re-index. Deferred.
+      TASKS (cheapest value first, each gated by the ~30 known-answer eval set
+      from 6.5 -- if top-6 already contains the answer, (a) is sufficient):
+      (a) `answer_query` command: top-6 hybrid hits -> prompt -> existing
+          Ollama 1B (`gemma3:1b`) via HTTP, explicit Ask button in
+          `search.tsx`, citations + UNANSWERABLE. Zero downloads; proves
+          whether 1B faithfulness is enough.
+      (b) Serve properly: same command via own `llama-server` binary, second
+          port, on-demand start/stop; swap in OCC-RAG-1.7B GGUF only if (a)
+          hallucinates.
+      (c) Query rewrite button: only if eval shows vague queries failing.
+      (d) Caption backfill: only if text-free shots stay unfindable after a-c.
+- [ ] 6.5 Reranking only if 6.1 results feel wrong in practice. NOTE: a text
+      cross-encoder (Qwen3-Reranker, bge, MiniLM) scores query-vs-OCR-text
+      pairs only -- it never sees pixels, so it cannot rescue or boost the
+      visual arm's hits (the 74 text-free screenshots hybrid exists for). On a
+      pure-text RAG corpus this would be a different call; here it would
+      systematically down-weight exactly what visual search adds. Measure the
+      top-10-but-not-top-3 pattern on ~30 known-answer queries before adding one.
 
 ---
 

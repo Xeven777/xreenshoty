@@ -29,6 +29,8 @@ import { MAX_DELAY, type Settings } from "@/lib/settings"
 import { bindShortcut, releaseShortcut } from "@/lib/shortcuts"
 import { useThumbnails } from "@/lib/use-thumbnails"
 import {
+  dirOf,
+  fileName,
   ShotCard,
   ShotPreview,
   usePreview,
@@ -36,6 +38,7 @@ import {
 import {
   beginRegionSelect,
   captureActiveWindow,
+  deleteScreenshot,
   captureFullscreen,
   closeRegionOverlay,
   getDefaultSaveDir,
@@ -60,10 +63,6 @@ type Mode = "fullscreen" | "region" | "window"
 const HISTORY_LIMIT = 60
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
-
-function fileName(path: string) {
-  return path.split(/[/\\]/).pop() ?? path
-}
 
 export function Capture({
   settings,
@@ -125,14 +124,19 @@ export function Capture({
   }, [tauri])
 
   // Index PNGs already sitting in the save folder, then show history. Import is
-  // idempotent, so this is safe on every launch.
-  const bootstrapped = useRef(false)
+  // idempotent, so this is safe to re-run. Keyed on the last folder handled, not
+  // on a "have we ever booted" boolean — otherwise editing the save folder left
+  // history pointing at the old directory until some later capture happened to
+  // call `refresh()`.
+  const importedDir = useRef<string | null>(null)
   useEffect(() => {
-    if (!tauri || !saveDir || bootstrapped.current) return
-    bootstrapped.current = true
+    if (!tauri || !saveDir) return
+    const dir = saveDir.trim()
+    if (importedDir.current === dir) return
+    importedDir.current = dir
     void (async () => {
       try {
-        await importExisting(saveDir.trim() || null)
+        await importExisting(dir || null)
       } catch {
         /* import is a convenience; a failure must not block startup */
       }
@@ -140,9 +144,27 @@ export function Capture({
     })()
   }, [tauri, saveDir, refresh])
 
-// Thumbnails are loaded in a small worker pool rather than all at once. Each
   const preview = usePreview()
-  const thumbs = useThumbnails(useMemo(() => history.map((h) => h.path), [history]))
+  const thumbs = useThumbnails(
+    useMemo(() => history.map((h) => h.path), [history])
+  )
+
+  /** Removes the PNG from disk and its row from the index, then drops it from
+   *  the visible list. The file goes last: if the DB write fails the picture is
+   *  still there. */
+  const removeItem = useCallback(
+    (item: Screenshot) => {
+      deleteScreenshot(item.path)
+        .then(() => {
+          setHistory((prev) => prev.filter((h) => h.path !== item.path))
+          setStatus({ kind: "ok", text: `Deleted ${fileName(item.path)}` })
+        })
+        .catch((e: unknown) =>
+          setStatus({ kind: "err", text: String(e) })
+        )
+    },
+    []
+  )
 
   useEffect(() => () => void (abortRef.current = true), [])
 
@@ -157,7 +179,7 @@ export function Capture({
     void (async () => {
       const [onPicked, onCancelled] = await Promise.all([
         listen<RegionRect | null>(REGION_SELECTED, (event) =>
-          regionResultRef.current(event.payload ?? null),
+          regionResultRef.current(event.payload ?? null)
         ),
         listen(REGION_CANCELLED, () => regionResultRef.current(null)),
       ])
@@ -184,8 +206,8 @@ export function Capture({
             rect.y,
             rect.width,
             rect.height,
-            dirArg,
-          ),
+            dirArg
+          )
         )
       }
     } finally {
@@ -219,6 +241,19 @@ export function Capture({
     setBusy(null)
     setCountdown(null)
     abortRef.current = false
+  }
+
+  /** Abandon whatever is in flight. During the countdown the loop polls
+   *  `abortRef` and unwinds itself; once the overlay owns the screen nothing
+   *  else will, so tear it down here — otherwise the app sits with every
+   *  capture control disabled and no visible way out (H1). */
+  async function cancelCapture() {
+    abortRef.current = true
+    if (busy === "region" && countdown === null) {
+      await closeRegionOverlay().catch(() => undefined)
+      await restoreMainWindow().catch(() => undefined)
+      resetCapture()
+    }
   }
 
   /** Cancellable countdown. Returns false when the user cancelled. */
@@ -323,7 +358,7 @@ export function Capture({
   const countdownLabel =
     countdown !== null ? `Capturing in ${countdown}…` : "Capture"
 
-function stepDelay(delta: number) {
+  function stepDelay(delta: number) {
     update("delaySecs", Math.min(MAX_DELAY, Math.max(0, delaySecs + delta)))
   }
 
@@ -418,8 +453,8 @@ function stepDelay(delta: number) {
             </div>
           </header>
           <p className="text-xs leading-relaxed text-muted-foreground">
-            The screen freezes, then you drag a box over it. Add a delay first if
-            you need to move the window you want to grab.
+            The screen freezes, then you drag a box over it. Add a delay first
+            if you need to move the window you want to grab.
           </p>
           <Button
             onClick={() => void startRegionSelect()}
@@ -459,22 +494,33 @@ function stepDelay(delta: number) {
         </section>
       </div>
 
-      {capturing && countdown !== null ? (
+      {capturing && (countdown !== null || busy === "region") ? (
         <div className="flex items-center justify-between gap-4 rounded-2xl border bg-card p-4 shadow-sm">
           <p className="text-sm text-muted-foreground">
-            {busy === "region"
-              ? "Region"
-              : busy === "window"
-                ? "Active window"
-                : "Fullscreen"}{" "}
-            capture starts in{" "}
-            <span className="font-semibold text-foreground">{countdown}s</span>
+            {countdown === null ? (
+              <>
+                Region capture waiting for a selection — drag on the overlay, or
+                cancel.
+              </>
+            ) : (
+              <>
+                {busy === "region"
+                  ? "Region"
+                  : busy === "window"
+                    ? "Active window"
+                    : "Fullscreen"}{" "}
+                capture starts in{" "}
+                <span className="font-semibold text-foreground">
+                  {countdown}s
+                </span>
+              </>
+            )}
           </p>
           <Button
             size="sm"
             variant="destructive"
             onClick={() => {
-              abortRef.current = true
+              void cancelCapture()
             }}
           >
             <X data-icon="inline-start" />
@@ -588,8 +634,9 @@ function stepDelay(delta: number) {
                 item={item}
                 thumb={thumbs[item.path]}
                 onOpen={preview.show}
+                onDelete={removeItem}
                 onOpenFolder={() =>
-                  openFolder(dirArg).catch((e) =>
+                  openFolder(dirOf(item.path)).catch((e) =>
                     setStatus({ kind: "err", text: String(e) })
                   )
                 }
@@ -602,8 +649,13 @@ function stepDelay(delta: number) {
       <ShotPreview
         item={preview.item}
         onClose={preview.hide}
-        onOpenFolder={() =>
-          openFolder(dirArg).catch((e) => setStatus({ kind: "err", text: String(e) }))
+        onOpenFolder={
+          preview.item
+            ? () =>
+                openFolder(dirOf(preview.item!.path)).catch((e) =>
+                  setStatus({ kind: "err", text: String(e) })
+                )
+            : undefined
         }
       />
     </div>

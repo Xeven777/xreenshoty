@@ -65,6 +65,22 @@ Ollama cannot be used for this model at all: its `/api/embed` is text-only.
   nothing. Compare cosine between two rows. Real spread over 8 screenshots is
   min 0.57 / max 0.997 — the high pair was two shots 13s apart, which is
   correct for near-duplicates. This check is what caught the silent-drop bug.
+- **vec0 needs `distance_metric=cosine` stated explicitly.** The default is L2,
+  which is not a similarity. The table is declared with the metric so
+  `distance` is directly `1 - cosine`; `db::l2_to_cosine` exists only to
+  interpret older L2 tables. Migrating the table is NOT a rename:
+  `ALTER TABLE ... RENAME TO` renames the virtual table but leaves its shadow
+  tables under the old prefix, and the table becomes unreadable ("Error
+  preparing rowid scan: no such table: screenshot_vec_rowids"). Worse, `DROP`
+  on the broken table fails and the drops roll back with the transaction, so a
+  partial repair loops forever. When a vec0 table is truly broken, delete the
+  database and let the indexer rebuild from the PNGs -- files are the source of
+  truth.
+- **Similarity must be shown as one number, not two.** The bar and its label
+  must come from the same value. An earlier version scaled the bar against the
+  best hit while printing the raw cosine, so "0.67" sat next to an almost-full
+  bar; that reads as broken. Also never print `1/(1+distance)`: it is not a
+  similarity and collapses every result into 51-59%.
 - **vec0 KNN needs an aliased `k`.** `WHERE embedding MATCH ?1 AND k = 5` in a
   JOIN silently returns arbitrary rows with distance 0.0000. Write
   `v.embedding MATCH ?1 AND v.k = ?2`. `search_similar` does this.
@@ -106,6 +122,16 @@ Ollama cannot be used for this model at all: its `/api/embed` is text-only.
 - **`vec0` does not support UPSERT.** `ON CONFLICT DO UPDATE` on a `vec0` virtual
   table fails with "UPSERT not implemented". Use DELETE + INSERT inside one
   transaction instead.
+- **Hybrid search normalises before blending, and both arms degrade
+  independently.** BM25 (0..30) and cosine distance (0..1) cannot be added
+  raw, so each arm is min-max rescaled (lower raw = better on both) and blended
+  0.44 OCR / 0.56 visual. A doc missing from one arm takes that arm's floor, not
+  zero, or the 74 text-free screenshots become unfindable. **min-of-empty is
+  infinity** -- an arm with no results must contribute 0.0, else every score ties
+  and the id tiebreak returns an arbitrary order. RRF survives only behind
+  `XREENSHOTY_FUSION=rrf` for A/B; weights move with
+  `XREENSHOTY_FUSION_WEIGHTS="0.44,0.56"`. The 0.44/0.56 split is a user
+  preference, not a measured optimum -- there are no relevance labels yet.
 - **FTS5 `MATCH` input must be sanitised.** `-`, `"`, `*`, `:` and `OR` are query
   operators; raw user input will raise a syntax error. `db::fts_query` splits on
   non-alphanumerics and wraps each term in quotes, so no operator can survive.
@@ -205,6 +231,14 @@ already `tsc -b` — do not "simplify" it back to `--noEmit`.
   required so normal typing is never hijacked.
 - **Settings persist in `localStorage`** under `xreenshoty.settings`; session
   history under `xreenshoty.history`. Rust holds no state.
+- **Voice is push-to-talk through `voice.rs`.** `voice_start` spawns
+  `pw-record` at 16 kHz mono (`arecord -f cd` fallback), `voice_stop` ends it
+  with SIGTERM so the recorder flushes a valid WAV header -- SIGKILL leaves a
+  truncated file (`fmt chunk missing`) the transcriber rejects. Transcription
+  shells out to the `voice-env` venv python (`cactus-needle`;
+  `needle.transcribe` returns a dict with `"text"`), with `HF_HUB_OFFLINE=1`
+  so it stays offline against the `~/.cache` weights. Temp WAVs live in
+  `temp_dir()` and are deleted after transcribe/cancel.
 - **Files are the source of truth, not the DB.** Milestone 4 must keep PNGs in
   Pictures; SQLite is metadata only.
 - **Metadata is recorded in `save_png`, not per capture mode.** All three modes

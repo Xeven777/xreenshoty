@@ -51,6 +51,10 @@ export function RegionOverlay() {
   function handlePointerDown(event: React.PointerEvent) {
     if (event.button !== 0) return
     event.preventDefault()
+    // Capture keeps the drag alive when the button is released past the edge of
+    // the monitor. Without it `pointerup` never arrives, so no result event is
+    // emitted and the main window waits forever (H1).
+    event.currentTarget.setPointerCapture(event.pointerId)
     setAnchor({ x: event.clientX, y: event.clientY })
     setCursor({ x: event.clientX, y: event.clientY })
   }
@@ -66,9 +70,7 @@ export function RegionOverlay() {
     const height = Math.round(Math.abs(event.clientY - start.y))
 
     void finish(
-      width < MIN_SIZE || height < MIN_SIZE
-        ? null
-        : { x, y, width, height },
+      width < MIN_SIZE || height < MIN_SIZE ? null : { x, y, width, height }
     )
   }
 
@@ -92,6 +94,12 @@ export function RegionOverlay() {
         setCursor({ x: event.clientX, y: event.clientY })
       }
       onPointerUp={handlePointerUp}
+      onPointerCancel={(event) => {
+        // The browser took the gesture over (touch pan, compositor grab).
+        // Abandoning still has to emit, or the main window stays wedged.
+        event.preventDefault()
+        void finish(null)
+      }}
       onContextMenu={(event) => {
         event.preventDefault()
         void finish(null)
@@ -174,7 +182,7 @@ export function RegionOverlay() {
 
 function useRect(
   anchor: { x: number; y: number } | null,
-  cursor: { x: number; y: number } | null,
+  cursor: { x: number; y: number } | null
 ) {
   if (!anchor || !cursor) return null
   return {

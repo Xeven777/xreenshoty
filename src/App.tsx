@@ -16,16 +16,18 @@ export default function App() {
   return (
     <div className="mx-auto w-full max-w-5xl space-y-6 p-6">
       <header className="flex items-center gap-4">
-        <div className="grid size-11 shrink-0 place-items-center rounded-2xl bg-primary text-primary-foreground">
-          <Camera size={22} weight="bold" />
-        </div>
+        <img
+          src="/logo.svg"
+          alt="xreenshoty logo"
+          className="size-12 shrink-0 rounded-md shadow-sm hover:scale-102 transition-all duration-300 active:scale-95 active:rotate-2"
+        />
         <div className="min-w-0 flex-1">
           <h1 className="text-2xl font-semibold tracking-tight">xreenshoty</h1>
           <p className="truncate text-sm text-muted-foreground">
             Local-first screenshots you can search later
           </p>
         </div>
-        <Badge variant="secondary">Milestone 3</Badge>
+        <Badge variant="secondary">Milestone 5</Badge>
       </header>
 
       <div className="flex justify-end">
@@ -63,7 +65,7 @@ export default function App() {
         {/* keepMounted for the same reason as Capture: the thumbnail cache and
             results survive a tab round-trip. */}
         <TabsContent value="search" keepMounted>
-          <Search saveDir={settings.saveDir} />
+          <Search />
         </TabsContent>
 
         <TabsContent value="settings">

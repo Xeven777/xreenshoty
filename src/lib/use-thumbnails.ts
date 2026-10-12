@@ -39,7 +39,7 @@ export function useThumbnails(paths: string[]) {
         }
       }
       await Promise.all(
-        Array.from({ length: Math.min(CONCURRENCY, queue.length) }, worker),
+        Array.from({ length: Math.min(CONCURRENCY, queue.length) }, worker)
       )
       if (cancelled) return
 

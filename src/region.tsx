@@ -8,5 +8,5 @@ import { RegionOverlay } from "@/components/region-overlay"
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <RegionOverlay />
-  </StrictMode>,
+  </StrictMode>
 )
