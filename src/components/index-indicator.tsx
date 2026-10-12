@@ -2,8 +2,10 @@ import { useCallback, useEffect, useState } from "react"
 import { isTauri } from "@tauri-apps/api/core"
 import { listen } from "@tauri-apps/api/event"
 import { Circle } from "@phosphor-icons/react"
+import { AnimatePresence, motion } from "motion/react"
 
 import { indexPause, indexStatus, type IndexStatus } from "@/lib/screenshot"
+import { toast } from "@/lib/toast"
 
 const POLL_MS = 4000
 
@@ -51,8 +53,6 @@ export function IndexIndicator() {
     if (!tauri) return
     void refresh()
     const poll = setInterval(() => void refresh(), POLL_MS)
-    // The indexer also pushes after every batch, so a backfill shows progress
-    // immediately instead of lagging up to one poll interval behind.
     const un = listen<IndexStatus>("index-progress", (e) =>
       setStatus(e.payload)
     )
@@ -64,38 +64,48 @@ export function IndexIndicator() {
 
   if (!status) return null
   const state = describe(status)
-  if (state.kind === "done") return null
   const paused = state.kind === "paused"
 
   return (
-    <button
-      type="button"
-      title={paused ? "Resume indexing" : "Pause indexing"}
-      onClick={() => {
-        void indexPause(!paused)
-        void refresh()
-      }}
-      className="flex items-center gap-2 rounded-full border bg-card px-3 py-1.5 text-xs transition-colors hover:bg-muted"
-      role="status"
-      aria-live="polite"
-    >
-      <Circle
-        size={12}
-        weight="fill"
-        className={
-          paused
-            ? "shrink-0 text-muted-foreground"
-            : "shrink-0 animate-pulse text-primary"
-        }
-      />
-      <span className="text-muted-foreground">
-        {state.kind === "loading" && "Loading model…"}
-        {state.kind === "ocr" && "Reading text…"}
-        {state.kind === "working" &&
-          `Indexing ${state.embedded} of ${state.total}`}
-        {state.kind === "paused" &&
-          `Paused at ${state.embedded} of ${state.total}`}
-      </span>
-    </button>
+    <AnimatePresence initial={false}>
+      {state.kind === "done" ? null : (
+        <motion.button
+          key="index-indicator"
+          type="button"
+          initial={{ opacity: 0, x: 10 }}
+          animate={{ opacity: 1, x: 0 }}
+          exit={{ opacity: 0, x: 10 }}
+          transition={{ duration: 0.3 }}
+          title={paused ? "Resume indexing" : "Pause indexing"}
+          onClick={() => {
+            void indexPause(!paused).then(() => {
+              toast(paused ? "Indexing resumed" : "Indexing paused")
+              refresh()
+            })
+          }}
+          className="absolute flex items-center gap-2 rounded-full border bg-card px-3 py-1.5 text-xs transition-colors hover:bg-muted"
+          role="status"
+          aria-live="polite"
+        >
+          <Circle
+            size={12}
+            weight="fill"
+            className={
+              paused
+                ? "shrink-0 text-muted-foreground"
+                : "shrink-0 animate-pulse text-primary"
+            }
+          />
+          <span className="text-muted-foreground">
+            {state.kind === "loading" && "Loading model…"}
+            {state.kind === "ocr" && "Scanning Image…"}
+            {state.kind === "working" &&
+              `Indexing ${state.embedded} of ${state.total}`}
+            {state.kind === "paused" &&
+              `Paused at ${state.embedded} of ${state.total}`}
+          </span>
+        </motion.button>
+      )}
+    </AnimatePresence>
   )
 }

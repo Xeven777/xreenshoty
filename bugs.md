@@ -36,7 +36,7 @@ hangs, event lost — nothing ever calls `resetCapture()`. Consequences:
 
 - All three capture buttons stay `disabled` (`capturing === true`).
 - The delay input is disabled too (`capture.tsx:505`).
-- The Cancel banner is *not* shown, because it requires `countdown !== null`
+- The Cancel banner is _not_ shown, because it requires `countdown !== null`
   and the countdown has already finished (`capture.tsx:462`).
 - The global shortcuts no-op, because `runCapture`/`startRegionSelect` bail on
   `if (busy) return` (`capture.tsx:199`, `:263`).
@@ -65,7 +65,7 @@ reach this state in the first place.
 
 ```ts
 const searching = tauri && term.length > 0 && term !== settled
-const searched  = tauri && term.length > 0 && term === settled
+const searched = tauri && term.length > 0 && term === settled
 ```
 
 `settled` stores only the term. The effect re-runs on `[term, mode, tauri]`, but
@@ -92,7 +92,7 @@ note under H3.
 
 The `catch` sets the error but never clears `results`, and the `finally` still
 runs `setSettled(term)`. So `searched` becomes `true` while `results` still
-holds the *previous* term's hits → `shown` renders them, and the count badge
+holds the _previous_ term's hits → `shown` renders them, and the count badge
 (`:146-153`) claims they match the current query. A user seeing "12 screenshots
 matching" next to an error message will read it as a successful search.
 
@@ -125,18 +125,18 @@ useEffect(() => {
 }, [tauri, saveDir, refresh])
 ```
 
-`bootstrapped` latches on the *first* non-empty `saveDir`. Editing the folder in
+`bootstrapped` latches on the _first_ non-empty `saveDir`. Editing the folder in
 Settings (`settings-panel.tsx:140-146` or `capture.tsx:529-535`) does nothing to
 history: `importExisting(newDir)` never runs and `refresh()` never runs. The user
 captures into the new folder and the grid does not update until some later
 capture happens to call `refresh()`.
 
 **Fix:** `bootstrapped` became `importedDir`, a ref holding the last directory
-*handled* rather than a "has this ever run" boolean. Editing the save folder now
+_handled_ rather than a "has this ever run" boolean. Editing the save folder now
 re-runs `importExisting` + `refresh`. Import is already idempotent (dedupes on
 the UNIQUE `path`), so re-running on every change is free.
 
-### M2. Changing a shortcut can leave the *old* accelerator registered forever
+### M2. Changing a shortcut can leave the _old_ accelerator registered forever
 
 `src/components/capture.tsx:292-321`
 
@@ -197,14 +197,14 @@ selection geometry itself is cheap; the point is avoiding a render per event.
 
 `src/components/shot.tsx:202-211`, `capture.tsx:591-595`, `search.tsx:171`
 
-`onOpenFolder` always calls `openFolder(dirArg)` with the *current* save
+`onOpenFolder` always calls `openFolder(dirArg)` with the _current_ save
 setting. Rust-side, `open_folder` resolves and opens exactly that directory
 (`src-tauri/src/screenshot.rs:342-359`). For a screenshot captured before the
 save folder was changed — or one imported from elsewhere — the button opens the
 wrong directory.
 
 **Fix:** new `dirOf(path)` helper in `shot.tsx`, next to the existing `fileName`.
-Both callers — the history grid and the search results, each with its card *and*
+Both callers — the history grid and the search results, each with its card _and_
 its `ShotPreview` — now open `dirOf(item.path)`. This also deleted `Search`'s
 `saveDir` prop, which had no other use.
 
@@ -230,7 +230,7 @@ trap Tab within; restore focus to the originating element on close; add
 
 - `setVisualError(null)` runs only inside the visual branch; `setError(null)`
   only inside the text branch. A failed visual search keeps showing
-  *"Visual search is unavailable: …"* after the user switches back to **Words**
+  _"Visual search is unavailable: …"_ after the user switches back to **Words**
   and gets successful text results.
 - Clearing the query returns early from the effect (`:47`) without clearing
   either error, so the banner remains visible over the empty state.
@@ -262,7 +262,7 @@ is accepted verbatim:
 
 `src/components/index-indicator.tsx:71-98`
 
-`role="status"` (an implicit `aria-live="polite"` region) *replaces* the native
+`role="status"` (an implicit `aria-live="polite"` region) _replaces_ the native
 `button` role on a control that has an `onClick`. Screen readers announce it as
 a status region and lose "button, 1 of 1", so the pause action is not discoverable
 as actionable.
@@ -301,7 +301,7 @@ and a `CustomEvent` dispatch — all for a listener that only exists when
 `import.meta.env.DEV`. It sits directly on the thumbnail hot path (6 concurrent
 `getThumbnail` calls per batch).
 
-The `DebugPanel` component itself *is* tree-shaken out of the production bundle
+The `DebugPanel` component itself _is_ tree-shaken out of the production bundle
 (verified: no `ctui-debug-panel` strings in `dist/assets/*.js`), so this is
 overhead on the caller side only.
 
@@ -479,7 +479,7 @@ Both tabs are `keepMounted` (`App.tsx:55-67`), so this is visible in normal use.
 
 ---
 
-## Checked and *not* a problem
+## Checked and _not_ a problem
 
 Recording these so they are not re-investigated:
 
@@ -526,7 +526,7 @@ marked below.
 Three facts combine:
 
 1. `pending(limit)` selects `WHERE needs_ocr OR needs_embedding … ORDER BY
-   created_at ASC LIMIT 25` — oldest first, **no preference for rows that only
+created_at ASC LIMIT 25` — oldest first, **no preference for rows that only
    need OCR**.
 2. `mark_embedding_skipped(id)` sets `embed_model = 'skipped'` and leaves
    `embedded_at` NULL. `pending()` keys `needs_embedding` off
@@ -593,11 +593,11 @@ let filename = format!("xreenshoty-{}-{}.png", timestamp(), sanitize(stem));
 `save_png` writes to that path with `image.save(&path)` and never checks for an
 existing file. The stems are highly repeatable:
 
-| mode | stem | collision likelihood |
-|---|---|---|
-| active window | `active-window` | constant — two presses in the same second |
-| fullscreen (one monitor) | `display-<id>` | constant |
-| region | `region-{x}x{y}-{w}x{h}` | constant for an identical drag |
+| mode                     | stem                     | collision likelihood                      |
+| ------------------------ | ------------------------ | ----------------------------------------- |
+| active window            | `active-window`          | constant — two presses in the same second |
+| fullscreen (one monitor) | `display-<id>`           | constant                                  |
+| region                   | `region-{x}x{y}-{w}x{h}` | constant for an identical drag            |
 
 Delay defaults to 0 (`settings.ts:15`), so nothing throttles rapid captures.
 Two captures in the same second produce one file: the second overwrites the
@@ -627,17 +627,17 @@ anywhere in `src-tauri/src`** (verified by grep), and Rust does not reap or
 terminate children on drop. On app exit the `llama-server` is orphaned and
 reparented to init, keeping an ~825 MB model plus its GPU allocation resident.
 
-AGENTS.md states: *"a `Drop` impl kills the child so an 825 MB model is never
-left resident."* That is not implemented.
+AGENTS.md states: _"a `Drop` impl kills the child so an 825 MB model is never
+left resident."_ That is not implemented.
 
 Knock-on effect on the next launch: `Embedder::start()` sees `/health`
 answering and takes the early-return path (`embedder.rs:161-173`), logging
-*"reusing an already-running llama-server … its GPU is whatever it was started
-with"* — which is true, but the "somebody else" is the previous run of this
+_"reusing an already-running llama-server … its GPU is whatever it was started
+with"_ — which is true, but the "somebody else" is the previous run of this
 same app.
 
 **Fix:** `Embedder::shutdown()` takes the child, `kill()`s and `wait()`s it.
-`child` is only ever `Some` when *this* process spawned it, so a reused server is
+`child` is only ever `Some` when _this_ process spawned it, so a reused server is
 never killed — the "reuse somebody else's llama-server" case is untouched.
 
 `Drop` alone would **not** have fixed this, and that is the interesting part:
@@ -648,7 +648,7 @@ returns — the one point guaranteed to execute exactly once at exit. `impl Drop
 is kept as a backstop for the normal (non-static) case.
 
 Covered by `embedder::tests::shutdown_kills_the_server_we_spawned`. The
-assertion is on *timing*, not on the pid: with a working `kill()`, `wait()`
+assertion is on _timing_, not on the pid: with a working `kill()`, `wait()`
 reaps the child immediately, so shutdown returns in well under a second;
 without it, `wait()` blocks until the stand-in process exits on its own. A plain
 "is the pid gone" check passes either way, just 20 seconds later — verified by
@@ -665,14 +665,14 @@ AGENTS.md's claim is now true.
 Tauri runs non-`async` commands on the main thread unless marked
 `#[tauri::command(async)]`. These are all synchronous:
 
-| command | file:line | blocking work |
-|---|---|---|
-| `capture_fullscreen` | `screenshot.rs:128-160` | 1–N monitor grabs + PNG encode + disk write |
-| `capture_region` | `screenshot.rs:216-228` | grab + encode + write |
-| `capture_active_window` | `screenshot.rs:299-311` | X11 round trips + grab + encode |
-| `backdrop_data_url` | `region.rs:29-36` | full-monitor PNG encode + base64 of the result |
-| `save_region_from_backdrop` | `region.rs:120-158` | crop + PNG encode + write |
-| `open_folder` / `list_monitors` / `default_save_dir` | `screenshot.rs` | smaller, but still main thread |
+| command                                              | file:line               | blocking work                                  |
+| ---------------------------------------------------- | ----------------------- | ---------------------------------------------- |
+| `capture_fullscreen`                                 | `screenshot.rs:128-160` | 1–N monitor grabs + PNG encode + disk write    |
+| `capture_region`                                     | `screenshot.rs:216-228` | grab + encode + write                          |
+| `capture_active_window`                              | `screenshot.rs:299-311` | X11 round trips + grab + encode                |
+| `backdrop_data_url`                                  | `region.rs:29-36`       | full-monitor PNG encode + base64 of the result |
+| `save_region_from_backdrop`                          | `region.rs:120-158`     | crop + PNG encode + write                      |
+| `open_folder` / `list_monitors` / `default_save_dir` | `screenshot.rs`         | smaller, but still main thread                 |
 
 `backdrop_data_url` is the worst offender: a 1920×1080 RGBA frame is 8 MB
 before encoding, and the base64 data URL handed to the overlay is ~10–15 MB.
@@ -733,8 +733,8 @@ app startup unblocked.
 
 `src-tauri/src/db.rs:542-553`
 
-> *"Marked done even when embedding was skipped, so OCR-only rows stop being
-> retried forever while the model server is unavailable."*
+> _"Marked done even when embedding was skipped, so OCR-only rows stop being
+> retried forever while the model server is unavailable."_
 
 The statement only touches `embed_model`. Nothing in `pending()` reads that
 column (`db.rs:476`: `(embedded_at IS NULL) AS needs_embedding`), so the row
@@ -742,7 +742,7 @@ stays pending. The promised behaviour is not implemented — and is the direct
 cause of BH1.
 
 **Fix:** the comment was wrong, not the code — and the wrongness was worth
-keeping. A skipped row *must* stay pending, because "skipped" means "could not
+keeping. A skipped row _must_ stay pending, because "skipped" means "could not
 try yet", not "finished": if it stopped being retried, every screenshot
 captured before the model was installed would stay unembedded forever, even
 after the user starts a server.
@@ -751,7 +751,7 @@ So the comment now says that, and the function no longer rewrites `embed_model`
 for rows already marked (which was pure churn — an UPDATE per row per idle
 poll). Asserted in `pending_puts_rows_that_need_ocr_first`.
 
-The retry-every-poll cost for genuinely *failing* rows (corrupt PNG, server
+The retry-every-poll cost for genuinely _failing_ rows (corrupt PNG, server
 errors) is still open — it needs an attempt counter and backoff, which is more
 than this fix should carry.
 
@@ -827,8 +827,8 @@ still grows unbounded.
 `src-tauri/src/db.rs:517-540`, `src-tauri/src/embedder.rs:57-61`
 
 `set_embedding` stores `embed_model`, and both its own doc comment and
-`model_label()`'s say the purpose is *"so a later model change can be detected
-instead of silently mixing incompatible embeddings."* No code ever queries
+`model_label()`'s say the purpose is _"so a later model change can be detected
+instead of silently mixing incompatible embeddings."_ No code ever queries
 that column — not `search_similar` (`db.rs:652-690`), not `index_status`, not
 any migration. Swap `XREENSHOTY_EMBED_MODEL` and the index silently
 accumulates two incompatible vector spaces in one `vec0` table; KNN then ranks
@@ -863,7 +863,7 @@ blocks the `std::thread::scope` join in `indexer.rs:191-203`, which blocks the
 async worker, which stops indexing for the rest of the session. There is no
 watchdog anywhere.
 
-**Fix:** two halves, because the timeout alone only changes *how long* the stall
+**Fix:** two halves, because the timeout alone only changes _how long_ the stall
 lasts rather than removing it.
 
 1. **`ocr::run_with_timeout`** spawns and polls `try_wait`, killing the child once
@@ -871,7 +871,7 @@ lasts rather than removing it.
    stdlib polling is enough and this already runs on a dedicated worker thread.
    Limit is `XREENSHOTY_OCR_TIMEOUT_SECS`, default 60s.
 2. **A failed row is now marked attempted** (`indexer.rs:227`). Without this the
-   timeout converts a permanent hang into a *periodic* one: `ocr_boxes` stays
+   timeout converts a permanent hang into a _periodic_ one: `ocr_boxes` stays
    NULL, so `pending()` hands the same hopeless image back every `IDLE_POLL` and
    the worker pays the full timeout again, forever.
 
@@ -895,8 +895,8 @@ worker is sitting in `tokio::select!` on `wake.notified()` **or**
 `sleep(IDLE_POLL)` — both fresh — so it can be up to 20 s before the loop
 re-runs and sees `paused == false`.
 
-The `PAUSE_POLL` constant is documented as *"While paused, wake this often so a
-resume is felt immediately"*, but the `continue` at `:158` goes back to the
+The `PAUSE_POLL` constant is documented as _"While paused, wake this often so a
+resume is felt immediately"_, but the `continue` at `:158` goes back to the
 `select!`, so the 400 ms sleep only delays one iteration; it does not make
 resume prompt. The comment describes behaviour the code does not have.
 
@@ -906,8 +906,8 @@ after pausing and shows a stale value.
 **Fix:** `index_pause` now calls `wake.notify_one()` (`indexer.rs:98`), so both
 transitions wake the worker out of `select!` instead of waiting out `IDLE_POLL`.
 
-`PAUSE_POLL` is still what makes a *pause* cheap — it keeps the loop turning
-while paused so the flag is re-checked — but it is not what makes a *resume*
+`PAUSE_POLL` is still what makes a _pause_ cheap — it keeps the loop turning
+while paused so the flag is re-checked — but it is not what makes a _resume_
 prompt, and its comment was implying otherwise. The behaviour it advertised now
 comes from the notify.
 
@@ -965,8 +965,8 @@ frontend sends raw `clientX/clientY`, and `save_region_from_backdrop` uses them
 directly as physical indices into the backdrop (`region.rs:145-154`). At scale
 factor 2 only the top-left quarter of the monitor would be selectable.
 
-Documented as a known limitation in AGENTS.md (*"Fine at scale 1; revisit if
-you enable HiDPI"*), recorded here so it is not forgotten when HiDPI is
+Documented as a known limitation in AGENTS.md (_"Fine at scale 1; revisit if
+you enable HiDPI"_), recorded here so it is not forgotten when HiDPI is
 attempted.
 
 ### BL5. Dead API surface on both sides
@@ -1027,7 +1027,7 @@ minutes".
 
 ---
 
-## Checked and *not* a problem (backend)
+## Checked and _not_ a problem (backend)
 
 - **FTS5 triggers are correct.** The `ai`/`ad`/`au` triggers on
   `screenshots_fts` (`db.rs:84-106`) handle the external-content table
@@ -1039,7 +1039,7 @@ minutes".
   quoting each term leaves no operator reachable; the unit tests at
   `db.rs:699-711` cover the exact inputs that would otherwise be syntax errors.
 - **`should_chain`'s anti-spin guard works as designed** for the case it was
-  written for (a full batch where *nothing* was processable). Its test at
+  written for (a full batch where _nothing_ was processable). Its test at
   `indexer.rs:317-326` passes. The defect in BH1 is that `touched` is also 0
   for a batch where rows were deliberately skipped — a case the test does not
   cover.

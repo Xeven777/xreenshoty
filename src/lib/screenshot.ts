@@ -1,4 +1,5 @@
 import { trackedInvoke } from "./tauri"
+import { toastFailed } from "./toast"
 
 export interface MonitorInfo {
   id: number
@@ -58,6 +59,10 @@ export function deleteScreenshot(path: string) {
 
 export function openFolder(path: string | null) {
   return trackedInvoke<void>("open_folder", { path })
+}
+
+export function openFolderSafe(path: string | null) {
+  return openFolder(path).catch((e) => toastFailed("Couldn't open folder", e))
 }
 
 /** Downscaled PNG as a data URL, generated in Rust so any folder works. */

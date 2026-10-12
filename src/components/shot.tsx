@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { memo, useCallback, useEffect, useState } from "react"
 import {
   ArrowsOut,
   CaretDown,
@@ -8,6 +8,7 @@ import {
   Trash,
   X,
 } from "@phosphor-icons/react"
+import { AnimatePresence, motion } from "motion/react"
 
 import { Button } from "@/components/ui/button"
 import {
@@ -17,15 +18,9 @@ import {
   type Screenshot,
   type ScreenshotDetail,
 } from "@/lib/screenshot"
-
-export function fileName(path: string) {
-  return path.split(/[/\\]/).pop() ?? path
-}
-
-export function dirOf(path: string) {
-  const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"))
-  return i > 0 ? path.slice(0, i) : path
-}
+import { toastCopied, toastFailed } from "@/lib/toast"
+import { fileName } from "@/lib/utils"
+import { getCachedPreview, setCachedPreview } from "@/lib/use-thumbnails"
 
 const PREVIEW_SIZE = 1600
 const START = "\u001f"
@@ -33,7 +28,8 @@ const END = "\u001e"
 
 export function usePreview() {
   const [item, setItem] = useState<Screenshot | null>(null)
-  return { item, show: setItem, hide: () => setItem(null) }
+  const hide = useCallback(() => setItem(null), [])
+  return { item, show: setItem, hide }
 }
 
 export function Snippet({ text }: { text: string }) {
@@ -83,6 +79,14 @@ function zToPercent(z: number) {
   return Math.round(((clamped + 2) / 4) * 100)
 }
 
+function scorePercent(score: number, scoreZ?: number | null) {
+  return scoreZ == null ? Math.round(score * 100) : zToPercent(scoreZ)
+}
+
+function formatDate(created: number) {
+  return new Date(created).toLocaleString()
+}
+
 function ScoreBar({
   score,
   scoreZ,
@@ -94,7 +98,7 @@ function ScoreBar({
 }) {
   // Rescaled from the z-score so the set spreads 0..100 instead of 93..97.
   // No z (single hit, zero spread) falls back to the raw cosine percent.
-  const percent = scoreZ == null ? Math.round(score * 100) : zToPercent(scoreZ)
+  const percent = scorePercent(score, scoreZ)
   const { bar, text } = similarityTone(scoreZ ?? 0)
   const track = tone === "overlay" ? "bg-white/15" : "bg-black/10"
   const fill = tone === "overlay" ? "bg-white/90" : bar
@@ -168,9 +172,11 @@ function ShotDetails({
     try {
       await navigator.clipboard.writeText(detail.ocr_text)
       setCopied(true)
+      toastCopied()
       setTimeout(() => setCopied(false), 1500)
-    } catch {
+    } catch (e) {
       setFailed(true)
+      toastFailed("Copy failed", e)
     }
   }
 
@@ -310,7 +316,7 @@ export function ShotPreview({
   score?: number | null
   scoreZ?: number | null
   onClose: () => void
-  onOpenFolder?: () => void
+  onOpenFolder?: (item: Screenshot) => void
 }) {
   const [loaded, setLoaded] = useState<{ path: string; url: string } | null>(
     null
@@ -319,10 +325,14 @@ export function ShotPreview({
 
   useEffect(() => {
     if (!item) return
+    // Cache hits are picked up during render; only a miss fetches.
+    if (getCachedPreview(item.path)) return
     let cancelled = false
     getThumbnail(item.path, PREVIEW_SIZE)
       .then((url) => {
-        if (!cancelled) setLoaded({ path: item.path, url })
+        if (cancelled) return
+        setCachedPreview(item.path, url)
+        setLoaded({ path: item.path, url })
       })
       .catch(() => {
         if (!cancelled) setFailedPath(item.path)
@@ -332,7 +342,9 @@ export function ShotPreview({
     }
   }, [item])
 
-  const full = item && loaded?.path === item.path ? loaded.url : null
+  const cachedUrl = item ? getCachedPreview(item.path) : undefined
+  const full =
+    item && loaded?.path === item.path ? loaded.url : (cachedUrl ?? null)
   const failed = item != null && failedPath === item.path
 
   useEffect(() => {
@@ -344,91 +356,122 @@ export function ShotPreview({
     return () => window.removeEventListener("keydown", onKey)
   }, [item, onClose])
 
-  if (!item) return null
-
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-label={fileName(item.path)}
-      className="fixed inset-0 z-50 flex flex-col bg-black/80 p-4 backdrop-blur-md sm:p-8"
-      onClick={onClose}
-    >
-      <div
-        className="mx-auto flex min-h-0 w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-white/10 bg-neutral-900 shadow-2xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <header className="flex shrink-0 items-center gap-2 px-4 py-3">
-          <div className="min-w-0 flex-1">
-            <p className="truncate text-sm font-medium text-white">
-              {fileName(item.path)}
-            </p>
-            <p className="text-xs text-white/50">
-              {new Date(item.created_at).toLocaleString()} · {item.width}×
-              {item.height} · {item.source}
-            </p>
-          </div>
-          <Button
-            size="icon-sm"
-            variant="ghost"
-            title="Open in image viewer"
-            className="text-white/70 hover:bg-white/10 hover:text-white"
-            onClick={() => {
-              openFile(item.path).catch(() => undefined)
-            }}
-          >
-            <ArrowsOut />
-          </Button>
-          {onOpenFolder ? (
-            <Button
-              size="icon-sm"
-              variant="ghost"
-              title="Open save folder"
-              className="text-white/70 hover:bg-white/10 hover:text-white"
-              onClick={onOpenFolder}
-            >
-              <FolderOpen />
-            </Button>
-          ) : null}
-          <Button
-            size="icon-sm"
-            variant="ghost"
-            title="Close (Esc)"
-            className="text-white/70 hover:bg-white/10 hover:text-white"
-            onClick={onClose}
-          >
-            <X />
-          </Button>
-        </header>
-
-        <div className="grid min-h-0 flex-1 place-items-center overflow-auto bg-black/40 p-4">
-          {full ? (
-            <img
-              src={full}
-              alt={fileName(item.path)}
-              className="max-h-[55vh] max-w-full rounded-lg object-contain shadow-2xl"
-            />
-          ) : (
-            <p className="text-sm text-white/60">
-              {failed ? "Could not load the image." : "Loading full size…"}
-            </p>
-          )}
-        </div>
-
-        <ShotDetails
+    <AnimatePresence>
+      {item ? (
+        <motion.div
           key={item.path}
-          path={item.path}
-          score={score}
-          scoreZ={scoreZ}
-        />
-      </div>
-    </div>
+          role="dialog"
+          aria-modal="true"
+          aria-label={fileName(item.path)}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          // Exit is deliberately faster than the enter: the backdrop's job on
+          // close is to get out of the way, not to keep the moment going.
+          exit={{
+            opacity: 0,
+            transition: { duration: 0.12, ease: [0.4, 0, 1, 1] },
+          }}
+          transition={{ duration: 0.18 }}
+          className="fixed inset-0 z-50 flex flex-col bg-black/80 p-4 sm:p-8"
+          onClick={onClose}
+        >
+          <motion.div
+            initial={{ opacity: 0, scale: 0.97, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{
+              opacity: 0,
+              scale: 0.98,
+              y: 6,
+              // Snappier than the enter spring — arriving gets the spring,
+              // leaving gets 120ms.
+              transition: { duration: 0.12, ease: [0.4, 0, 1, 1] },
+            }}
+            transition={{ type: "spring", stiffness: 380, damping: 32 }}
+            className="mx-auto flex min-h-0 w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-white/10 bg-neutral-900 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <header className="flex shrink-0 items-center gap-2 px-4 py-3">
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-medium text-white">
+                  {fileName(item.path)}
+                </p>
+                <p className="text-xs text-white/50">
+                  {formatDate(item.created_at)} · {item.width}×{item.height} ·{" "}
+                  {item.source}
+                </p>
+              </div>
+              <Button
+                size="icon-sm"
+                variant="ghost"
+                title="Open in image viewer"
+                className="text-white/70 hover:bg-white/10 hover:text-white"
+                onClick={() => {
+                  openFile(item.path).catch((e) =>
+                    toastFailed("Couldn't open image", e)
+                  )
+                }}
+              >
+                <ArrowsOut />
+              </Button>
+              {onOpenFolder ? (
+                <Button
+                  size="icon-sm"
+                  variant="ghost"
+                  title="Open save folder"
+                  className="text-white/70 hover:bg-white/10 hover:text-white"
+                  onClick={() => onOpenFolder(item)}
+                >
+                  <FolderOpen />
+                </Button>
+              ) : null}
+              <Button
+                size="icon-sm"
+                variant="ghost"
+                title="Close (Esc)"
+                className="text-white/70 hover:bg-white/10 hover:text-white"
+                onClick={onClose}
+              >
+                <X />
+              </Button>
+            </header>
+
+            <div className="grid min-h-0 flex-1 place-items-center overflow-auto bg-black/40 p-4">
+              {full ? (
+                <motion.img
+                  key={item.path}
+                  src={full}
+                  alt={fileName(item.path)}
+                  initial={{ opacity: 0, scale: 0.98 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  transition={{ duration: 0.2 }}
+                  decoding="async"
+                  className="max-h-[55vh] max-w-full rounded-lg object-contain shadow-2xl"
+                />
+              ) : (
+                <p className="text-sm text-white/60">
+                  {failed ? "Could not load the image." : "Loading full size…"}
+                </p>
+              )}
+            </div>
+
+            <ShotDetails
+              key={item.path}
+              path={item.path}
+              score={score}
+              scoreZ={scoreZ}
+            />
+          </motion.div>
+        </motion.div>
+      ) : null}
+    </AnimatePresence>
   )
 }
 
-export function ShotCard({
+export const ShotCard = memo(function ShotCard({
   item,
   thumb,
+  index = 0,
   snippet,
   score,
   scoreZ,
@@ -438,26 +481,46 @@ export function ShotCard({
 }: {
   item: Screenshot
   thumb?: string
+  /** Position in the rendered list; drives the entrance stagger only. */
+  index?: number
   snippet?: string | null
   score?: number | null
   scoreZ?: number | null
   onOpen: (item: Screenshot) => void
-  onOpenFolder?: () => void
+  onOpenFolder?: (item: Screenshot) => void
   onDelete?: (item: Screenshot) => void
 }) {
   const name = fileName(item.path)
   return (
-    <figure className="group overflow-hidden rounded-xl border bg-card transition-[transform,box-shadow,border-color] duration-150 focus-within:border-primary/40 hover:-translate-y-0.5 hover:border-primary/40 hover:shadow-lg">
+    <motion.figure
+      // No `layout` here: the grid uses `content-visibility`, so scroll-in
+      // hands the card a real box where the intrinsic placeholder was, and a
+      // layout animation would size-shift every card mid-scroll. Removal is
+      // animated by the grid's `popLayout` + this exit instead.
+      exit={{ opacity: 0, scale: 0.96 }}
+      initial={{ opacity: 0, y: 8 }}
+      whileInView={{ opacity: 1, y: 0 }}
+      viewport={{ once: true, margin: "80px" }}
+      transition={{
+        duration: 0.22,
+        ease: "easeOut",
+        // Cascade the first few cards so a settled search does not drop the
+        // whole grid in on one frame. Capped — decorative, never blocking.
+        delay: Math.min(index, 8) * 0.04,
+      }}
+      className="group overflow-hidden rounded-xl border bg-card transition-[transform,box-shadow,border-color] duration-150 focus-within:border-primary/40 hover:-translate-y-0.5 hover:border-primary/40 hover:shadow-lg"
+    >
       <button
         type="button"
         onClick={() => onOpen(item)}
         title={`View ${name}`}
-        className="relative block w-full cursor-zoom-in outline-none"
+        className="relative block w-full cursor-zoom-in transition-transform duration-150 outline-none active:scale-[0.98]"
       >
         {thumb ? (
           <img
             src={thumb}
             alt={name}
+            decoding="async"
             className="aspect-video w-full bg-muted object-cover"
             loading="lazy"
           />
@@ -477,9 +540,7 @@ export function ShotCard({
         </span>
         {score != null ? (
           <span className="absolute top-2 right-2 rounded-full bg-black/70 px-2 py-0.5 text-[11px] font-medium text-white tabular-nums">
-            {scoreZ != null
-              ? `${zToPercent(scoreZ)}%`
-              : `${Math.round(score * 100)}%`}
+            {scorePercent(score, scoreZ)}%
           </span>
         ) : null}
       </button>
@@ -488,7 +549,7 @@ export function ShotCard({
           <div className="min-w-0 flex-1">
             <p className="truncate text-xs font-medium">{name}</p>
             <p className="text-[11px] text-muted-foreground">
-              {new Date(item.created_at).toLocaleString()}
+              {formatDate(item.created_at)}
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
@@ -497,7 +558,7 @@ export function ShotCard({
                 size="icon-xs"
                 variant="ghost"
                 title="Open save folder"
-                onClick={onOpenFolder}
+                onClick={() => onOpenFolder(item)}
               >
                 <FolderOpen />
               </Button>
@@ -525,6 +586,6 @@ export function ShotCard({
           </div>
         ) : null}
       </figcaption>
-    </figure>
+    </motion.figure>
   )
-}
+})

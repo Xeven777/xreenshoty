@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { isTauri } from "@tauri-apps/api/core"
 import {
   Eye,
@@ -11,13 +11,15 @@ import {
   TextAa,
   XIcon,
 } from "@phosphor-icons/react"
-import { AnimatePresence, motion } from "motion/react"
+import { AnimatePresence, motion, useInView } from "motion/react"
 
 import { Badge } from "@/components/ui/badge"
-import { dirOf, ShotCard, ShotPreview, usePreview } from "@/components/shot"
+import { ShotCard, ShotPreview, usePreview } from "@/components/shot"
 import { Input } from "@/components/ui/input"
+import { errorText, toastFailed } from "@/lib/toast"
+import { dirOf } from "@/lib/utils"
 import {
-  openFolder,
+  openFolderSafe,
   searchHybrid,
   searchSimilar,
   searchText,
@@ -25,6 +27,7 @@ import {
   voiceStart,
   voiceStop,
   type SearchHit,
+  type Screenshot,
 } from "@/lib/screenshot"
 import { useThumbnails } from "@/lib/use-thumbnails"
 
@@ -67,6 +70,10 @@ function VoiceButton({ onText }: { onText: (t: string) => void }) {
   const [state, setState] = useState<"idle" | "recording" | "working">("idle")
   const [error, setError] = useState<string | null>(null)
   const stateRef = useRef(state)
+  const buttonRef = useRef<HTMLButtonElement>(null)
+  // The Search tab is keepMounted, so a hidden button still exists — without
+  // this gate the recording pulse and ping ring kept running off-screen.
+  const inView = useInView(buttonRef)
   useEffect(() => {
     stateRef.current = state
   }, [state])
@@ -80,7 +87,7 @@ function VoiceButton({ onText }: { onText: (t: string) => void }) {
         if (text) onText(text)
         else setError("Heard nothing — try again closer to the mic.")
       } catch (err) {
-        setError(String(err))
+        setError(errorText(err))
       }
       setState("idle")
       return
@@ -90,7 +97,7 @@ function VoiceButton({ onText }: { onText: (t: string) => void }) {
       await voiceStart()
       setState("recording")
     } catch (err) {
-      setError(String(err))
+      setError(errorText(err))
     }
   }
 
@@ -106,10 +113,12 @@ function VoiceButton({ onText }: { onText: (t: string) => void }) {
   }, [])
 
   const recording = state === "recording"
+  const pulse = recording && inView
 
   return (
     <>
       <motion.button
+        ref={buttonRef}
         type="button"
         title={
           recording
@@ -119,10 +128,10 @@ function VoiceButton({ onText }: { onText: (t: string) => void }) {
         aria-label="Voice search"
         aria-pressed={recording}
         onClick={() => void toggle()}
-        whileTap={{ scale: 0.88 }}
-        animate={recording ? { scale: [1, 1.12, 1] } : { scale: 1 }}
+        whileTap={{ scale: 0.94 }}
+        animate={pulse ? { scale: [1, 1.12, 1] } : { scale: 1 }}
         transition={
-          recording
+          pulse
             ? { duration: 1.4, repeat: Infinity, ease: "easeInOut" }
             : { type: "spring", stiffness: 500, damping: 22 }
         }
@@ -133,7 +142,11 @@ function VoiceButton({ onText }: { onText: (t: string) => void }) {
         }`}
       >
         {recording ? (
-          <span className="absolute inset-0 animate-ping rounded-full bg-destructive/40" />
+          <span
+            className={`absolute inset-0 rounded-full bg-destructive/40 ${
+              pulse ? "animate-ping" : ""
+            }`}
+          />
         ) : null}
         {state === "working" ? (
           <SpinnerGap size={17} className="animate-spin" />
@@ -156,19 +169,6 @@ function VoiceButton({ onText }: { onText: (t: string) => void }) {
           </motion.span>
         ) : null}
       </AnimatePresence>
-      <AnimatePresence>
-        {recording ? (
-          <motion.span
-            initial={{ opacity: 0, x: 6 }}
-            animate={{ opacity: 1, x: 0 }}
-            exit={{ opacity: 0, x: 6 }}
-            transition={{ duration: 0.2 }}
-            className="mr-1 hidden text-xs font-medium text-destructive sm:block"
-          >
-            Listening…
-          </motion.span>
-        ) : null}
-      </AnimatePresence>
     </>
   )
 }
@@ -180,7 +180,7 @@ function runSearch(mode: Mode, query: string): Promise<SearchHit[]> {
 }
 
 export function Search() {
-  const tauri = useMemo(() => isTauri(), [])
+  const tauri = isTauri()
   const preview = usePreview()
   const [query, setQuery] = useState("")
   const [mode, setMode] = useState<Mode>("combined")
@@ -209,6 +209,10 @@ export function Search() {
 
   const thumbs = useThumbnails(useMemo(() => shown.map((r) => r.path), [shown]))
 
+  const openFolderOf = useCallback((item: Screenshot) => {
+    void openFolderSafe(dirOf(item.path))
+  }, [])
+
   useEffect(() => {
     if (!tauri || term.length === 0) return
 
@@ -226,7 +230,8 @@ export function Search() {
         setElapsed(Math.max(1, Math.round(performance.now() - started)))
       } catch (e) {
         if (seq.current !== n) return
-        setFailure({ key: k, msg: String(e) })
+        setFailure({ key: k, msg: errorText(e) })
+        toastFailed("Search failed", e, () => void searchNow())
       } finally {
         if (seq.current === n) setSettled(k)
       }
@@ -235,6 +240,7 @@ export function Search() {
     return () => {
       clearTimeout(timer)
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [term, mode, key, tauri])
 
   async function searchNow() {
@@ -251,7 +257,8 @@ export function Search() {
       setElapsed(Math.max(1, Math.round(performance.now() - started)))
     } catch (e) {
       if (seq.current !== n) return
-      setFailure({ key: k, msg: String(e) })
+      setFailure({ key: k, msg: errorText(e) })
+      toastFailed("Search failed", e, () => void searchNow())
     } finally {
       if (seq.current === n) setSettled(k)
     }
@@ -277,7 +284,7 @@ export function Search() {
                 aria-pressed={mode === opt.id}
                 title={opt.blurb}
                 onClick={() => setMode(opt.id)}
-                className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-colors duration-150 outline-none focus-visible:ring-2 focus-visible:ring-ring/40 ${
+                className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-[color,background-color,box-shadow] duration-150 outline-none focus-visible:ring-2 focus-visible:ring-ring/40 ${
                   mode === opt.id
                     ? "bg-card text-foreground shadow-sm"
                     : "text-muted-foreground hover:text-foreground"
@@ -360,7 +367,7 @@ export function Search() {
           className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4"
         >
           {Array.from({ length: 8 }).map((_, i) => (
-            <div key={i} className="overflow-hidden rounded-2xl border bg-card">
+            <div key={i} className="overflow-hidden rounded-xl border bg-card">
               <div className="aspect-video animate-pulse bg-muted" />
               <div className="space-y-1.5 p-2.5">
                 <div className="h-3 w-2/3 animate-pulse rounded bg-muted" />
@@ -370,7 +377,7 @@ export function Search() {
           ))}
         </div>
       ) : shown.length === 0 ? (
-        <div className="flex items-center gap-3 rounded-2xl border bg-card p-6 text-sm text-muted-foreground">
+        <div className="flex items-center gap-3 rounded-xl border bg-card p-6 text-sm text-muted-foreground">
           <ImageIcon size={20} className="shrink-0" />
           <div>
             <p className="font-medium text-foreground">
@@ -385,31 +392,31 @@ export function Search() {
                 ? "See the message above."
                 : searched
                   ? "Try fewer or more common words."
-                  : "Try “login screen”, “bookmarks”, “red error dialog”…"}
+                  : "Try “login screen”, “terminal”, “red error dialog”…"}
             </p>
           </div>
         </div>
       ) : (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-          {shown.map((item, i) => (
-            <div
-              key={`${settled}:${item.path}`}
-              className="animate-rise"
-              style={{ animationDelay: `${Math.min(i, 11) * 35}ms` }}
-            >
+        <div className="shot-grid grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+          {/* AnimatePresence renders no DOM of its own, so the cards stay
+              direct grid children while its direct children (the cards) are
+              what gets exit-animated. popLayout pops the leaving card out of
+              flow instead of leaving a gap. */}
+          <AnimatePresence mode="popLayout" initial={false}>
+            {shown.map((item, i) => (
               <ShotCard
+                key={item.path}
                 item={item}
+                index={i}
                 thumb={thumbs[item.path]}
                 snippet={mode === "visual" ? null : item.snippet}
                 score={mode === "ocr" ? null : item.score}
                 scoreZ={mode === "ocr" ? null : item.score_z}
                 onOpen={preview.show}
-                onOpenFolder={() =>
-                  openFolder(dirOf(item.path)).catch(() => undefined)
-                }
+                onOpenFolder={openFolderOf}
               />
-            </div>
-          ))}
+            ))}
+          </AnimatePresence>
         </div>
       )}
 
@@ -426,11 +433,7 @@ export function Search() {
             : null
         }
         onClose={preview.hide}
-        onOpenFolder={
-          preview.item
-            ? () => openFolder(dirOf(preview.item!.path)).catch(() => undefined)
-            : undefined
-        }
+        onOpenFolder={openFolderOf}
       />
     </div>
   )

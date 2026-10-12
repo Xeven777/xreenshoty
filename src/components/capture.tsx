@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { isTauri } from "@tauri-apps/api/core"
 import { listen, type UnlistenFn } from "@tauri-apps/api/event"
+import { AnimatePresence, motion } from "motion/react"
 import {
   AppWindow,
   Camera,
-  CheckCircle,
   Crop,
   FolderOpen,
   Image as ImageIcon,
@@ -27,14 +27,15 @@ import {
 import { notify } from "@/lib/notify"
 import { MAX_DELAY, type Settings } from "@/lib/settings"
 import { bindShortcut, releaseShortcut } from "@/lib/shortcuts"
-import { useThumbnails } from "@/lib/use-thumbnails"
 import {
-  dirOf,
-  fileName,
-  ShotCard,
-  ShotPreview,
-  usePreview,
-} from "@/components/shot"
+  toastDeleted,
+  toastFailed,
+  toastSaved,
+  toastSavedMany,
+} from "@/lib/toast"
+import { useThumbnails } from "@/lib/use-thumbnails"
+import { dirOf, fileName } from "@/lib/utils"
+import { ShotCard, ShotPreview, usePreview } from "@/components/shot"
 import {
   beginRegionSelect,
   captureActiveWindow,
@@ -45,21 +46,14 @@ import {
   importExisting,
   listMonitors,
   listRecent,
-  openFolder,
+  openFolderSafe,
   restoreMainWindow,
   saveRegionFromBackdrop,
   type MonitorInfo,
   type Screenshot,
 } from "@/lib/screenshot"
-import { cn } from "@/lib/utils"
-
-interface Status {
-  kind: "ok" | "err"
-  text: string
-}
 
 type Mode = "fullscreen" | "region" | "window"
-
 const HISTORY_LIMIT = 60
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
@@ -73,11 +67,10 @@ export function Capture({
   update: <K extends keyof Settings>(key: K, value: Settings[K]) => void
   onShortcutError: (message: string | null) => void
 }) {
-  const tauri = useMemo(() => isTauri(), [])
+  const tauri = isTauri()
   const [monitors, setMonitors] = useState<MonitorInfo[]>([])
   const [monitorSel, setMonitorSel] = useState("all")
   const [history, setHistory] = useState<Screenshot[]>([])
-  const [status, setStatus] = useState<Status | null>(null)
   const [busy, setBusy] = useState<Mode | null>(null)
   const [countdown, setCountdown] = useState<number | null>(null)
   const abortRef = useRef(false)
@@ -90,7 +83,8 @@ export function Capture({
     try {
       setHistory(await listRecent(HISTORY_LIMIT))
     } catch (e) {
-      setStatus({ kind: "err", text: `Could not load history: ${String(e)}` })
+      // No retry action: refresh re-runs on every capture/import anyway.
+      toastFailed("Could not load history", e)
     }
   }, [])
 
@@ -112,11 +106,7 @@ export function Capture({
         setMonitors(mons)
       })
       .catch((e) => {
-        if (!cancelled)
-          setStatus({
-            kind: "err",
-            text: `Monitor lookup failed: ${String(e)}`,
-          })
+        if (!cancelled) toastFailed("Monitor lookup failed", e)
       })
     return () => {
       cancelled = true
@@ -152,19 +142,18 @@ export function Capture({
   /** Removes the PNG from disk and its row from the index, then drops it from
    *  the visible list. The file goes last: if the DB write fails the picture is
    *  still there. */
-  const removeItem = useCallback(
-    (item: Screenshot) => {
-      deleteScreenshot(item.path)
-        .then(() => {
-          setHistory((prev) => prev.filter((h) => h.path !== item.path))
-          setStatus({ kind: "ok", text: `Deleted ${fileName(item.path)}` })
-        })
-        .catch((e: unknown) =>
-          setStatus({ kind: "err", text: String(e) })
-        )
-    },
-    []
-  )
+  const removeItem = useCallback((item: Screenshot) => {
+    deleteScreenshot(item.path)
+      .then(() => {
+        setHistory((prev) => prev.filter((h) => h.path !== item.path))
+        toastDeleted(item.path)
+      })
+      .catch((e: unknown) => toastFailed("Delete failed", e))
+  }, [])
+
+  const openFolderOf = useCallback((item: Screenshot) => {
+    void openFolderSafe(dirOf(item.path))
+  }, [])
 
   useEffect(() => () => void (abortRef.current = true), [])
 
@@ -221,7 +210,6 @@ export function Capture({
     if (!tauri || busy) return
     abortRef.current = false
     setBusy("region")
-    setStatus(null)
     try {
       if (!(await runCountdown())) return
       // From here the overlay owns the interaction; its event finishes the job.
@@ -229,7 +217,7 @@ export function Capture({
     } catch (e) {
       const cancelled = abortRef.current
       resetCapture()
-      if (!cancelled) setStatus({ kind: "err", text: String(e) })
+      if (!cancelled) toastFailed("Region capture failed", e)
     }
   }
 
@@ -278,16 +266,14 @@ export function Capture({
       if (abortRef.current) return
       const paths = Array.isArray(result) ? result : [result]
       await refresh()
-      setStatus({
-        kind: "ok",
-        text:
-          paths.length === 1
-            ? `Saved ${paths[0]}`
-            : `Saved ${paths.length} screenshots, latest: ${paths[0]}`,
-      })
+      if (paths.length === 1) {
+        toastSaved(paths[0], () => void openFolderSafe(dirOf(paths[0])))
+      } else {
+        toastSavedMany(paths.length, paths[0])
+      }
       if (notifyOnSave) void notify("Screenshot saved", fileName(paths[0]))
     } catch (e) {
-      if (!abortRef.current) setStatus({ kind: "err", text: String(e) })
+      if (!abortRef.current) toastFailed("Capture failed", e)
     } finally {
       resetCapture()
     }
@@ -298,7 +284,6 @@ export function Capture({
     if (!tauri || busy) return
     abortRef.current = false
     setBusy(mode)
-    setStatus(null)
     if (!(await runCountdown())) return
     await finishCapture(fn)
   }
@@ -322,7 +307,7 @@ export function Capture({
   useEffect(() => {
     actionsRef.current.fullscreen = doFullscreen
     actionsRef.current.window = doWindow
-  })
+  }, [monitorSel, dirArg, busy, tauri, delaySecs]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!tauri) return
@@ -374,31 +359,6 @@ export function Capture({
             </code>
             .
           </p>
-        </div>
-      ) : null}
-
-      {status ? (
-        <div
-          className={cn(
-            "flex items-start gap-3 rounded-2xl border border-transparent p-4 text-sm",
-            status.kind === "ok" ? "bg-primary/10" : "bg-destructive/10"
-          )}
-        >
-          {status.kind === "ok" ? (
-            <CheckCircle size={18} className="mt-0.5 shrink-0" />
-          ) : (
-            <Warning size={18} className="mt-0.5 shrink-0 text-destructive" />
-          )}
-          <p className="ui-selectable min-w-0 flex-1 break-all">
-            {status.text}
-          </p>
-          <button
-            onClick={() => setStatus(null)}
-            className="shrink-0 rounded-full p-1 hover:bg-muted"
-            aria-label="Dismiss"
-          >
-            <X size={14} />
-          </button>
         </div>
       ) : null}
 
@@ -494,40 +454,59 @@ export function Capture({
         </section>
       </div>
 
-      {capturing && (countdown !== null || busy === "region") ? (
-        <div className="flex items-center justify-between gap-4 rounded-2xl border bg-card p-4 shadow-sm">
-          <p className="text-sm text-muted-foreground">
-            {countdown === null ? (
-              <>
-                Region capture waiting for a selection — drag on the overlay, or
-                cancel.
-              </>
-            ) : (
-              <>
-                {busy === "region"
-                  ? "Region"
-                  : busy === "window"
-                    ? "Active window"
-                    : "Fullscreen"}{" "}
-                capture starts in{" "}
-                <span className="font-semibold text-foreground">
-                  {countdown}s
-                </span>
-              </>
-            )}
-          </p>
-          <Button
-            size="sm"
-            variant="destructive"
-            onClick={() => {
-              void cancelCapture()
-            }}
+      <AnimatePresence initial={false}>
+        {capturing && (countdown !== null || busy === "region") ? (
+          <motion.div
+            key="countdown"
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -6 }}
+            transition={{ duration: 0.18 }}
+            className="flex items-center justify-between gap-4 rounded-2xl border bg-card p-4 shadow-sm"
           >
-            <X data-icon="inline-start" />
-            Cancel
-          </Button>
-        </div>
-      ) : null}
+            <p className="text-sm text-muted-foreground">
+              {countdown === null ? (
+                <>
+                  Region capture waiting for a selection — drag on the overlay,
+                  or cancel.
+                </>
+              ) : (
+                <>
+                  {busy === "region"
+                    ? "Region"
+                    : busy === "window"
+                      ? "Active window"
+                      : "Fullscreen"}{" "}
+                  capture starts in{" "}
+                  <span className="relative inline-flex w-8 justify-center overflow-hidden font-semibold text-foreground tabular-nums">
+                    <AnimatePresence mode="popLayout" initial={false}>
+                      <motion.span
+                        key={countdown}
+                        initial={{ y: 12, opacity: 0 }}
+                        animate={{ y: 0, opacity: 1 }}
+                        exit={{ y: -12, opacity: 0 }}
+                        transition={{ duration: 0.18 }}
+                      >
+                        {countdown}s
+                      </motion.span>
+                    </AnimatePresence>
+                  </span>
+                </>
+              )}
+            </p>
+            <Button
+              size="sm"
+              variant="destructive"
+              onClick={() => {
+                void cancelCapture()
+              }}
+            >
+              <X data-icon="inline-start" />
+              Cancel
+            </Button>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
 
       <section className="space-y-3 rounded-2xl border bg-card p-5 shadow-sm">
         <div className="flex flex-wrap items-end gap-6">
@@ -584,11 +563,7 @@ export function Capture({
                 variant="secondary"
                 title="Open save folder"
                 disabled={!tauri}
-                onClick={() =>
-                  openFolder(dirArg).catch((e) =>
-                    setStatus({ kind: "err", text: String(e) })
-                  )
-                }
+                onClick={() => void openFolderSafe(dirArg)}
               >
                 <FolderOpen />
               </Button>
@@ -627,21 +602,24 @@ export function Capture({
             show up here.
           </div>
         ) : (
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-            {history.map((item) => (
-              <ShotCard
-                key={item.path}
-                item={item}
-                thumb={thumbs[item.path]}
-                onOpen={preview.show}
-                onDelete={removeItem}
-                onOpenFolder={() =>
-                  openFolder(dirOf(item.path)).catch((e) =>
-                    setStatus({ kind: "err", text: String(e) })
-                  )
-                }
-              />
-            ))}
+          <div className="shot-grid grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+            {/* AnimatePresence renders no DOM of its own, so the cards stay
+                direct grid children while its direct children (the cards) are
+                what gets exit-animated. popLayout pops the leaving card out of
+                flow instead of leaving a gap. */}
+            <AnimatePresence mode="popLayout" initial={false}>
+              {history.map((item, i) => (
+                <ShotCard
+                  key={item.path}
+                  item={item}
+                  index={i}
+                  thumb={thumbs[item.path]}
+                  onOpen={preview.show}
+                  onDelete={removeItem}
+                  onOpenFolder={openFolderOf}
+                />
+              ))}
+            </AnimatePresence>
           </div>
         )}
       </section>
@@ -649,14 +627,7 @@ export function Capture({
       <ShotPreview
         item={preview.item}
         onClose={preview.hide}
-        onOpenFolder={
-          preview.item
-            ? () =>
-                openFolder(dirOf(preview.item!.path)).catch((e) =>
-                  setStatus({ kind: "err", text: String(e) })
-                )
-            : undefined
-        }
+        onOpenFolder={openFolderOf}
       />
     </div>
   )

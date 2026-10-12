@@ -150,6 +150,24 @@ Ollama cannot be used for this model at all: its `/api/embed` is text-only.
   `src/components/shot.tsx` back both the history grid and search results;
   `usePreview()` holds the open item. Clicking a tile opens the in-app
   full-size viewer; the `open_file` command hands the original PNG to xdg-open.
+- **Toasts go through `src/lib/toast.ts` (sonner).** `<Toaster>` is mounted in
+  `main.tsx` *outside* `[data-ui-scroll-container]` so the scroll shell never
+  clips it. Copy lives in the `toastSaved`/`toastDeleted`/`toastFailed`
+  helpers — keep new feedback there, not raw `toast.*` calls. OS notifications
+  (`notify.ts`) are only for background saves; in-app feedback is sonner.
+- **Thumbnail/preview caches are module-level in `use-thumbnails.ts`.**
+  `useThumbnails` fills a 120-entry LRU keyed by path; the full-size preview
+  keeps the last 3. Both are shared across history and search — a path loads
+  once per session. `ShotCard` is `memo`ized, so only cards whose thumb
+  actually arrived re-render.
+- **Debug events are DEV-only, and heavy payloads are truncated.** `trackedInvoke`
+  skips `emitDebugEvent` outside `import.meta.env.DEV`, and `thumbnail`/
+  `backdrop_data_url` results are logged as `<NKB data-url>` — JSON-cloning a
+  base64 PNG per image stalls the grid (it also ran in prod builds).
+- **Region overlay drag geometry is direct-DOM.** `scheduleRect` rAF-coalesces
+  writes to the selection div's style; React state only flips on pointerdown/up.
+  Reverting to per-move `setState` re-renders the fullscreen backdrop at drag
+  rate.
 - **The thumbnail loader is shared.** `useThumbnails` in `src/lib/use-thumbnails.ts`
   backs both the history grid and search results; do not re-inline the worker pool.
 - **Indexing never blocks capture.** `save_png` writes the row and calls

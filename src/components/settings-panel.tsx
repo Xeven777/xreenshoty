@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useState } from "react"
 import { isTauri } from "@tauri-apps/api/core"
 import {
   Bell,
@@ -15,8 +15,9 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { MAX_DELAY, type Settings } from "@/lib/settings"
-import { getDefaultSaveDir, openFolder } from "@/lib/screenshot"
+import { getDefaultSaveDir, openFolderSafe } from "@/lib/screenshot"
 import { eventToAccelerator, prettyAccelerator } from "@/lib/shortcuts"
+import { toast } from "@/lib/toast"
 
 export function SettingsPanel({
   settings,
@@ -27,10 +28,19 @@ export function SettingsPanel({
   update: <K extends keyof Settings>(key: K, value: Settings[K]) => void
   shortcutError: string | null
 }) {
-  const tauri = useMemo(() => isTauri(), [])
+  const tauri = isTauri()
   const [recording, setRecording] = useState<
     "shortcutFullscreen" | "shortcutWindow" | null
   >(null)
+
+  // The banner lives in this tab only; a toast reaches the user wherever they
+  // are when the bind fails (usually triggered from Capture).
+  useEffect(() => {
+    if (shortcutError)
+      toast.error("Shortcut not registered", {
+        description: shortcutError,
+      })
+  }, [shortcutError])
 
   useEffect(() => {
     if (!recording) return
@@ -150,9 +160,7 @@ export function SettingsPanel({
               title="Open folder"
               disabled={!tauri || !settings.saveDir.trim()}
               onClick={() =>
-                openFolder(settings.saveDir.trim() || null).catch(
-                  () => undefined
-                )
+                void openFolderSafe(settings.saveDir.trim() || null)
               }
             >
               <FolderOpen />

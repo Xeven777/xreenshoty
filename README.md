@@ -11,6 +11,38 @@ Stop scrolling through 370 files named `Screenshot_2026-03-14.png`. xreenshoty c
 
 The files stay yours. PNGs live in `~/Pictures`. SQLite at `~/.local/share/xreenshoty/screenshots.db` holds metadata only. Delete the DB and the indexer rebuilds it from the PNGs.
 
+## Features
+
+Why xreenshoty hits different ✨
+
+⚡ **Capture everything, zero friction** fullscreen, active window, and drag-a-region with a frozen backdrop so what you select is exactly what gets saved. Global shortcuts reuse the same path, so delay, cancel, history, and notifications all work for free.
+
+🔍 **Search like you think** type a half-remembered error string, a button label, or a vibe like "dark dashboard with red graph". BM25 over OCR text plus cosine k-NN over image vectors, fused 0.44 / 0.56, finds it even when 74 of your 370 shots contain zero readable text.
+
+🧠 **Understands pixels, not just words** every screenshot gets a 768-d EmbeddingGemma 2 vector on your own GPU. Near-duplicates taken 13 seconds apart score 0.997. Totally different screens drop to 0.57. It knows the difference.
+
+🔒 **Offline to the bone** tesseract, llama-server, SQLite, and sqlite-vec all run on your box. No cloud, no account, no telemetry, no "sign in to continue". Pull the network cable and everything still works.
+
+🗂️ **Your files stay yours** PNGs live in `~/Pictures`, the DB is metadata only. Delete the DB and the indexer rebuilds it from the PNGs. A database bug can never eat a screenshot.
+
+👁️ **Buttery viewer** history grid plus search share the same thumbnail pool and shot tiles. One click opens the full-size in-app viewer, one more hands the original PNG to xdg-open. Thumbnails stream from Rust as base64 so any save folder just works.
+
+🎙️ **Push-to-talk voice search** hold the mic, say what you are looking for, Whistle transcribes it locally through an isolated venv. No Python in the main path, no audio ever leaves the machine.
+
+🚀 **Capture never blocks** `save_png` writes the row and pokes a background worker. OCR and embedding happen off the hot path while you keep working. The app even spawns its own llama-server and kills it on exit so 825 MB never sits resident.
+
+## Demo
+
+30 seconds, end to end.
+
+1. 📸 Press your shortcut. Grab fullscreen, active window, or drag a region.
+2. 💾 The shot lands in Pictures and the indexer wakes in the background.
+3. 🔍 Type what you remember, text or visual.
+4. 🎯 One cosine score per tile, one click to full size.
+
+Record a 30 second GIF of steps 1 to 4 and drop it at `./docs/demo.gif`.
+
+
 ## How it works
 
 ```text
@@ -59,14 +91,34 @@ Real timings from the dev box, Intel Arc A530M plus UHD 770 iGPU, 370 screenshot
 
 No Python in the main path. Rust talks HTTP to localhost for embeddings. Voice shells out to a venv only when you press the mic.
 
-## Quickstart
+## 🖥️ Platform support
 
-Requirements.
+| Platform | Status |
+|---|---|
+| 🐧 Linux + X11 + XFCE | ✅ Fully tested, this is the dev setup (MX Linux, Debian trixie base) |
+| 🐧 Other Linux + X11 | 🟡 Should work, active-window capture uses `_NET_ACTIVE_WINDOW` via x11rb |
+| 🐧 Linux + Wayland | ❌ Not a target yet, blocked on `libpipewire-0.3-dev` repo mismatch |
+| 🍎 macOS / 🪟 Windows | ❌ Not supported, capture path is X11 only |
 
-- Linux with X11. XFCE tested, Wayland is not a target yet
-- Bun and Rust stable
-- tesseract 5 with eng data, plus vulkaninfo for the GPU pick
-- Embedding model under ~/apps, llama-server binary b11541 or newer. Older builds lack EmbeddingGemma 2 support
+## 📦 Requirements
+
+System packages.
+
+- 🐧 Linux with X11, XFCE tested (`echo $XDG_SESSION_TYPE` should print `x11`)
+- 🦀 Rust stable toolchain + Cargo (Tauri 2 backend, `cargo check` must pass)
+- 🟢 Bun (frontend package manager, `bun install` then `bun run tauri dev`)
+- 🔤 tesseract 5 with `eng` data (`tesseract --version`, `eng.traineddata` present)
+- 🎮 Vulkan drivers + `vulkaninfo` (GPU auto-pick needs it, Intel Arc A530M tested on Mesa 25.0.7)
+- 🎤 `pw-record` or `arecord` for voice input, `xdg-open` for opening PNGs
+
+Models (all local, all yours).
+
+- `embeddinggemma-2-Q8_0.gguf`, text plus image embedding model with 768-d output
+- `mmproj-embeddinggemma-2-Q8_0.gguf`, vision projector required for image vectors
+- 🦙 llama-server binary **b11541 or newer**. Older builds lack the EmbeddingGemma 2 arch and fail with `unknown model architecture`. Must start with `--embeddings`
+- Optional for answer synthesis (next milestone): `gemma3:1b` or `LFM2.5-1.2B` in Ollama, zero new downloads
+
+## 🚀 Quickstart
 
 Run it.
 

@@ -5,7 +5,6 @@ import { Capture } from "@/components/capture"
 import { IndexIndicator } from "@/components/index-indicator"
 import { Search } from "@/components/search"
 import { SettingsPanel } from "@/components/settings-panel"
-import { Badge } from "@/components/ui/badge"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useSettings } from "@/lib/settings"
 
@@ -19,7 +18,7 @@ export default function App() {
         <img
           src="/logo.svg"
           alt="xreenshoty logo"
-          className="size-12 shrink-0 rounded-md shadow-sm hover:scale-102 transition-all duration-300 active:scale-95 active:rotate-2"
+          className="size-12 shrink-0 rounded-md shadow-sm transition-transform duration-300 hover:scale-102 active:scale-95 active:rotate-2"
         />
         <div className="min-w-0 flex-1">
           <h1 className="text-2xl font-semibold tracking-tight">xreenshoty</h1>
@@ -27,7 +26,6 @@ export default function App() {
             Local-first screenshots you can search later
           </p>
         </div>
-        <Badge variant="secondary">Milestone 5</Badge>
       </header>
 
       <div className="flex justify-end">
@@ -50,10 +48,6 @@ export default function App() {
           </TabsTrigger>
         </TabsList>
 
-        {/* keepMounted: without it Base UI unmounts Capture on every tab
-            switch, which discards the thumbnail cache and re-runs the whole
-            startup chain (import_existing, list_recent, listeners, shortcut
-            rebinds, 60 thumbnail decodes). */}
         <TabsContent value="capture" keepMounted>
           <Capture
             settings={settings}
