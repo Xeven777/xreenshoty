@@ -410,6 +410,13 @@ fn cache_key(parts: &[&[u8]]) -> String {
     format!("{hash:016x}")
 }
 
+/// Root of the on-disk thumbnail cache. `None` only when the OS reports no
+/// cache dir at all, in which case nothing is ever cached and nothing is
+/// clearable.
+fn thumb_cache_dir() -> Option<PathBuf> {
+    Some(dirs::cache_dir()?.join("xreenshoty").join("thumbs"))
+}
+
 /// Cached thumbnails live under the OS cache dir, keyed by source path plus
 /// mtime and size so an edited screenshot regenerates instead of going stale.
 fn thumb_cache_file(path: &Path, size: u32) -> Option<PathBuf> {
@@ -426,12 +433,7 @@ fn thumb_cache_file(path: &Path, size: u32) -> Option<PathBuf> {
         &mtime.to_le_bytes(),
         &meta.len().to_le_bytes(),
     ]);
-    Some(
-        dirs::cache_dir()?
-            .join("xreenshoty")
-            .join("thumbs")
-            .join(format!("{key}.png")),
-    )
+    thumb_cache_dir().map(|d| d.join(format!("{key}.png")))
 }
 
 /// Downscaled PNG data URL for session-history thumbnails. Served from Rust so
@@ -478,9 +480,93 @@ pub async fn thumbnail(path: String, size: Option<u32>) -> Result<String, String
     Ok(format!("data:image/png;base64,{}", STANDARD.encode(&png)))
 }
 
+/// Bytes currently held by the on-disk thumbnail cache.
+///
+/// Read separately from clearing so Settings can show the number instead of a
+/// button that silently does nothing when the cache is already empty.
+#[tauri::command]
+pub fn thumbnail_cache_size() -> Result<u64, String> {
+    let Some(dir) = thumb_cache_dir() else {
+        return Ok(0);
+    };
+    Ok(cache_size_in(&dir))
+}
+
+fn cache_size_in(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|e| std::fs::metadata(e.path()).ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// Empty the on-disk thumbnail cache.
+///
+/// Only the cached thumbnails are dropped — the PNGs in Pictures and their
+/// search entries are untouched, so the next grid render just regenerates each
+/// thumbnail from the original.
+///
+/// Individual files are removed rather than the directory itself, because
+/// `thumbnail` recreates its parent with `create_dir_all` and the caller may
+/// not have permission to unlink the directory from under another writer.
+#[tauri::command]
+pub fn clear_thumbnail_cache() -> Result<u64, String> {
+    let Some(dir) = thumb_cache_dir() else {
+        return Ok(0);
+    };
+    let freed = clear_cache_in(&dir);
+    log::info!("cleared thumbnail cache, freed {freed} bytes");
+    Ok(freed)
+}
+
+fn clear_cache_in(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut freed = 0u64;
+    for entry in entries.flatten() {
+        let size = std::fs::metadata(entry.path())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if std::fs::remove_file(entry.path()).is_ok() && size > 0 {
+            freed += size;
+        }
+    }
+    freed
+}
+
 #[cfg(test)]
 mod thumbnail_tests {
     use super::*;
+
+    #[test]
+    fn clearing_the_thumbnail_cache_removes_files_and_reports_bytes() {
+        // Goes through `clear_cache_in`, not the command: the command targets the
+        // real ~/.cache and a test that wiped it would be destructive.
+        let dir = std::env::temp_dir().join("xreenshoty-thumb-clear-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("aaaaaaaaaaaaaaaa.png");
+        let b = dir.join("bbbbbbbbbbbbbbbb.png");
+        std::fs::write(&a, vec![0u8; 100]).unwrap();
+        std::fs::write(&b, vec![0u8; 20]).unwrap();
+
+        assert_eq!(cache_size_in(&dir), 120);
+        assert_eq!(clear_cache_in(&dir), 120);
+        assert_eq!(cache_size_in(&dir), 0);
+        assert!(!a.exists() && !b.exists(), "clearing left files behind");
+
+        // Idempotent: a second clear on an empty cache is not an error.
+        assert_eq!(clear_cache_in(&dir), 0);
+        // A missing directory reads as empty rather than failing the command.
+        assert_eq!(cache_size_in(&dir.join("nope")), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn unique_path_suffixes_on_collision() {

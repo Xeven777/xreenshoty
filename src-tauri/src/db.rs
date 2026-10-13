@@ -313,19 +313,27 @@ fn insert(path: &Path, created_at: i64, width: u32, height: u32, source: &str) -
 /// 4-byte chunk length, `"IHDR"`, then width and height. Decoding the image
 /// just to learn its size costs orders of magnitude more, and `import_existing`
 /// does this once per file in the save folder on every launch.
-pub(crate) fn png_dimensions(path: &Path) -> Option<(u32, u32)> {
-    use std::io::Read;
-
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut header = [0u8; 24];
-    f.read_exact(&mut header).ok()?;
-
-    if &header[..8] != b"\x89PNG\r\n\x1a\n" || &header[12..16] != b"IHDR" {
-        return None;
+/// Width/height of an image, read from its header without decoding pixels.
+///
+/// PNG is still parsed by hand: it is the format `save_png` writes, so it is the
+/// overwhelmingly common case, and reading 24 bytes beats a full decode.
+///
+/// Everything else (JPEG, WebP, GIF — what pastes and browser saves actually
+/// produce) falls back to `image::guess_format`. That fallback is what makes a
+/// pasted JPEG indexable at all: widening `import_existing`'s extension filter
+/// alone changed nothing, because this function still rejected every non-PNG.
+pub(crate) fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() >= 24 && bytes[..8] == *b"\x89PNG\r\n\x1a\n" && &bytes[12..16] == b"IHDR" {
+        let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+        let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+        return (width > 0 && height > 0).then_some((width, height));
     }
-    let width = u32::from_be_bytes(header[16..20].try_into().ok()?);
-    let height = u32::from_be_bytes(header[20..24].try_into().ok()?);
-    (width > 0 && height > 0).then_some((width, height))
+
+    let format = screenshots::image::guess_format(&bytes).ok()?;
+    screenshots::image::load_from_memory_with_format(&bytes, format)
+        .ok()
+        .map(|img| (img.width(), img.height()))
 }
 
 /// Index PNGs already sitting in `dir`. Idempotent via the UNIQUE path column,
@@ -382,6 +390,25 @@ pub fn prune_missing() -> Result<usize, String> {
     Ok(gone.len())
 }
 
+/// Image formats accepted into the index.
+///
+/// Anything else in the save folder — a `.avif`, a `.tiff`, a `.txt` — is left
+/// alone rather than half-indexed: `thumbnail` decodes through `image` 0.24's
+/// default features, so a format it cannot decode would produce a row that
+/// renders the "…" placeholder forever and can never be embedded.
+///
+/// Compared case-insensitively because clipboard and browser saves are
+/// inconsistent (`IMG_1234.JPG` from a phone is as likely as `.jpg`).
+fn is_indexable_image(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "webp" | "gif")
+    )
+}
+
 #[tauri::command]
 pub async fn import_existing(dir: Option<String>) -> Result<usize, String> {
     // Reconcile before adding: a PNG deleted outside the app otherwise keeps a
@@ -405,7 +432,7 @@ pub async fn import_existing(dir: Option<String>) -> Result<usize, String> {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("png") {
+            if !is_indexable_image(&path) {
                 continue;
             }
         // Cheap pre-check so we do not decode every PNG on disk every launch.
@@ -420,7 +447,7 @@ pub async fn import_existing(dir: Option<String>) -> Result<usize, String> {
             continue;
         }
 
-        let Some((w, h)) = png_dimensions(&path) else {
+        let Some((w, h)) = image_dimensions(&path) else {
             continue;
         };
         let created_at = entry
@@ -1600,5 +1627,98 @@ fn prune_removes_gone_rows_and_their_search_entries() {
         for suffix in ["", "-wal", "-shm"] {
             std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
         }
+    }
+
+    #[test]
+    fn indexable_extensions_cover_what_clipboards_produce() {
+        for name in [
+            // `screenshots` writes these.
+            "Screenshot_2026-10-14.png",
+            // Browsers, clipboard managers and phones hand you these. All were
+            // silently skipped before the filter widened, so a pasted JPEG
+            // never appeared in history or search at all.
+            "Pasted image 2026-10-14.jpg",
+            "download.jpeg",
+            "site-logo.webp",
+            "clip.gif",
+        ] {
+            assert!(
+                is_indexable_image(Path::new(name)),
+                "{name} should be indexed"
+            );
+        }
+
+        // Extension case is inconsistent in the wild (`IMG_1234.JPG`).
+        assert!(is_indexable_image(Path::new("IMG_1234.JPG")));
+        assert!(is_indexable_image(Path::new("shot.PNG")));
+
+        // Formats `image` 0.24's default features cannot decode. Indexing them
+        // would create a row whose thumbnail always fails and which can never
+        // be embedded — worse than not indexing at all.
+        for name in ["clip.avif", "scan.tiff", "art.bmp", "notes.txt", "clip"] {
+            assert!(
+                !is_indexable_image(Path::new(name)),
+                "{name} must be left alone"
+            );
+        }
+    }
+
+    #[test]
+    fn import_indexes_a_pasted_jpeg_but_not_an_avif() {
+        let _guard = test_lock();
+        let db = std::env::temp_dir().join("xreenshoty-import-formats.db");
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+        std::env::set_var("XREENSHOTY_TEST_DB", &db);
+
+        let dir = std::env::temp_dir().join("xreenshoty-import-formats-dir");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A real PNG plus a real JPEG, which is what a paste or a browser save
+        // actually produces. Both must be admitted: the extension filter alone
+        // was not enough, because `image_dimensions` also has to accept them.
+        screenshots::image::RgbaImage::new(64, 32).save(dir.join("shot.png")).unwrap();
+        screenshots::image::RgbaImage::new(48, 24)
+            .save(dir.join("Pasted image.jpg"))
+            .unwrap();
+        std::fs::write(dir.join("clip.avif"), b"av1 data").unwrap();
+
+        let imported = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(import_existing(Some(dir.to_string_lossy().into_owned())))
+            .unwrap();
+
+        assert_eq!(imported, 2, "png + jpeg should both be admitted");
+        let rows: Vec<(String, i64, i64)> = with_conn(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT path, width, height FROM screenshots")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap();
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        })
+        .unwrap();
+
+        let jpg = rows
+            .iter()
+            .find(|(p, _, _)| p.ends_with("Pasted image.jpg"))
+            .expect("the pasted JPEG must be indexed");
+        assert_eq!(
+            (jpg.1, jpg.2),
+            (48, 24),
+            "dimensions must come from the JPEG header, not be guessed"
+        );
+        assert!(
+            !rows.iter().any(|(p, _, _)| p.ends_with("clip.avif")),
+            "avif must never be indexed"
+        );
+
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

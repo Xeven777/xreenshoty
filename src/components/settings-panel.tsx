@@ -2,6 +2,7 @@ import { useEffect, useState } from "react"
 import { isTauri } from "@tauri-apps/api/core"
 import {
   Bell,
+  Broom,
   Check,
   FolderOpen,
   Keyboard,
@@ -15,9 +16,16 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { MAX_DELAY, type Settings } from "@/lib/settings"
-import { getDefaultSaveDir, openFolderSafe } from "@/lib/screenshot"
+import {
+  clearThumbnailCache,
+  getDefaultSaveDir,
+  openFolderSafe,
+  thumbnailCacheSize,
+} from "@/lib/screenshot"
 import { eventToAccelerator, prettyAccelerator } from "@/lib/shortcuts"
-import { toast } from "@/lib/toast"
+import { clearMemoryCaches } from "@/lib/use-thumbnails"
+import { toastCacheCleared, toastFailed, toast } from "@/lib/toast"
+import { formatBytes } from "@/lib/utils"
 
 export function SettingsPanel({
   settings,
@@ -32,6 +40,39 @@ export function SettingsPanel({
   const [recording, setRecording] = useState<
     "shortcutFullscreen" | "shortcutWindow" | null
   >(null)
+  const [cacheBytes, setCacheBytes] = useState<number | null>(null)
+  const [clearing, setClearing] = useState(false)
+
+  // The cache size is only read when the tab is mounted, so the number stays
+  // honest for as long as Settings is open.
+  useEffect(() => {
+    if (!tauri) return
+    let cancelled = false
+    void thumbnailCacheSize()
+      .then((bytes) => {
+        if (!cancelled) setCacheBytes(bytes)
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [tauri])
+
+  async function clearCache() {
+    setClearing(true)
+    try {
+      const freed = await clearThumbnailCache()
+      // The in-memory pools must go too, or the grids keep serving what they
+      // already have and the clear looks like a no-op.
+      clearMemoryCaches()
+      setCacheBytes(0)
+      toastCacheCleared(freed)
+    } catch (error) {
+      toastFailed("Could not clear cache", error, () => void clearCache())
+    } finally {
+      setClearing(false)
+    }
+  }
 
   // The banner lives in this tab only; a toast reaches the user wherever they
   // are when the bind fails (usually triggered from Capture).
@@ -230,6 +271,45 @@ export function SettingsPanel({
             {settings.notifyOnSave ? "On" : "Off"}
           </Button>
         </div>
+        {!tauri ? (
+          <Badge variant="secondary">Needs the desktop shell</Badge>
+        ) : null}
+      </section>
+
+      <section className="space-y-4 rounded-2xl border bg-card p-5 shadow-sm">
+        <header className="flex items-center gap-2.5">
+          <Broom size={18} className="text-muted-foreground" />
+          <div>
+            <h2 className="font-medium">Cache</h2>
+            <p className="text-xs text-muted-foreground">
+              Downscaled copies of your screenshots, kept so scrolling the grid
+              stays instant
+            </p>
+          </div>
+        </header>
+        <div className="flex items-center justify-between gap-4">
+          <span className="text-sm tabular-nums">
+            {cacheBytes === null
+              ? "—"
+              : cacheBytes === 0
+                ? "Empty"
+                : formatBytes(cacheBytes)}
+          </span>
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={!tauri || clearing || cacheBytes === 0}
+            onClick={() => void clearCache()}
+          >
+            <Broom data-icon="inline-start" />
+            {clearing ? "Clearing…" : "Clear"}
+          </Button>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Only these cached copies are removed. Your PNGs, OCR text and search
+          results are untouched — thumbnails rebuild from the originals as you
+          scroll.
+        </p>
         {!tauri ? (
           <Badge variant="secondary">Needs the desktop shell</Badge>
         ) : null}

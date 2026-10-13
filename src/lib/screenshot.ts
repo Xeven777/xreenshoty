@@ -134,6 +134,17 @@ export function importExisting(dir: string | null) {
   return trackedInvoke<number>("import_existing", { dir })
 }
 
+/** Bytes held by the on-disk thumbnail cache. */
+export function thumbnailCacheSize() {
+  return trackedInvoke<number>("thumbnail_cache_size")
+}
+
+/** Drop every cached thumbnail. Returns the bytes freed. Regenerated on demand
+ *  from the original PNGs, so nothing is lost. */
+export function clearThumbnailCache() {
+  return trackedInvoke<number>("clear_thumbnail_cache")
+}
+
 /** Keyword search over OCR text. Returns hits with an FTS5 excerpt per row;
  *  match boundaries are marked with \u001f…\u001e for the UI to highlight. */
 export function searchText(query: string, limit = 50) {

@@ -45,6 +45,19 @@ export function setCachedPreview(path: string, url: string) {
 }
 
 /**
+ * Drop both in-memory caches.
+ *
+ * Clearing the disk cache alone is not enough: these module-level maps would
+ * keep serving every thumbnail the session already loaded, so the button would
+ * appear to do nothing. Mounted grids hold their own state, so they re-request
+ * on the next path change; anything not on screen regenerates.
+ */
+export function clearMemoryCaches() {
+  cache.clear()
+  previewCache.clear()
+}
+
+/**
  * Loads thumbnails for `paths`, skipping any already loaded.
  *
  * Shared by the history grid and search results: both render the same cards and

@@ -9,6 +9,7 @@ mod ocr;
 mod region;
 mod screenshot;
 mod voice;
+pub mod watch;
 
 fn external_navigation_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
     tauri::plugin::Builder::<R>::new("external-navigation")
@@ -38,6 +39,36 @@ fn external_navigation_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Watch the save folder for files that appear from outside the app.
+///
+/// A pasted or dragged-in image never calls `save_png`, so nothing poked the
+/// indexer and the file stayed invisible to search until the next launch. The
+/// watcher runs `import_existing` + `poke` whenever the folder goes quiet, which
+/// is the same reconciliation the launch path performs.
+///
+/// Rust holds no settings state (`AGENTS.md`): the folder lives in the
+/// webview's `localStorage`. At startup we cannot read it, so this watches the
+/// default Pictures folder; `importExisting(dir)` re-runs on every folder
+/// change from the frontend, which is what keeps a custom folder indexed.
+///
+/// Own thread rather than the async runtime: `watch::run` blocks for the life of
+/// the process, and holding an async worker on a blocking loop would starve the
+/// pool. Losing this thread degrades to launch-only indexing, never to a crash.
+fn spawn_folder_watch() {
+    let dir = screenshot::resolve_dir(None).map(|d| d.to_string_lossy().into_owned());
+    match dir {
+        Ok(dir) => {
+            if let Err(e) = std::thread::Builder::new()
+                .name("folder-watch".into())
+                .spawn(move || watch::run(dir))
+            {
+                log::warn!("watch: could not spawn watcher: {e}");
+            }
+        }
+        Err(e) => log::warn!("watch: no save folder to watch: {e}"),
+    }
+}
+
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(region::Backdrop::default())
@@ -66,6 +97,7 @@ pub fn run() {
             app.handle()
                 .plugin(tauri_plugin_global_shortcut::Builder::new().build())?;
             indexer::Indexer::start(app.handle().clone());
+            spawn_folder_watch();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -78,6 +110,8 @@ pub fn run() {
             screenshot::open_file,
             screenshot::open_folder,
             screenshot::thumbnail,
+            screenshot::thumbnail_cache_size,
+            screenshot::clear_thumbnail_cache,
             region::begin_region_select,
             region::close_region_overlay,
             region::restore_main_window,

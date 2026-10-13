@@ -321,6 +321,14 @@ them, per `capture.tsx:565-568`).
 **Fix direction:** acceptable as-is for 120 tiles; worth an eviction (LRU or
 per-key `URL`-style release) if the limit ever rises or thumbnails get larger.
 
+**Disk half addressed.** The unbounded part that *mattered* — the on-disk cache
+at `~/.cache/xreenshoty/thumbs`, one file per `(path, size, mtime, len)` with no
+expiry and no way for a user to reclaim it — now has a manual escape hatch:
+Settings → Cache → Clear (`clear_thumbnail_cache` + `clearMemoryCaches`). The
+in-memory LRU cap (`MAX_CACHED = 120`) is unchanged. Still no *automatic*
+eviction of orphaned entries from deleted screenshots; that would need an mtime
+or count cap, and is the remaining work here.
+
 ### L3. `usePreview()` returns a new `hide` on every render
 
 `src/components/shot.tsx:16-19`
@@ -779,6 +787,50 @@ folder the user did not ask for, and the status line cheerfully reports
 
 **Fix direction:** expand a leading `~/` against `dirs::home_dir()` (and
 optionally `~user/`, though that is rarely needed).
+
+### BM7. A file dropped into the save folder from outside was never indexed — **Fixed**
+
+Two independent gates rejected it.
+
+1. `import_existing` filtered on `extension() == Some("png")`, so anything a
+   browser, clipboard manager or phone saved — `.jpg`, `.jpeg`, `.webp`,
+   `.gif` — was skipped outright.
+2. Widening (1) alone changed nothing. `png_dimensions` hand-parsed a PNG IHDR
+   and returned `None` for everything else, so a JPEG still fell through the
+   dimension check and was dropped before the insert.
+
+Either way the file was invisible in history and unsearchable. Because nothing
+watched the folder, the only reconciliation ran on launch and on save-folder
+change, so a paste mid-session waited for a restart.
+
+**Fix:**
+
+- `is_indexable_image` accepts png/jpg/jpeg/webp/gif, case-insensitively.
+  `avif`, `tiff` and `bmp` stay out on purpose — `image` 0.24's default features
+  cannot decode them, and a row whose thumbnail always fails is worse than no
+  row.
+- `png_dimensions` became `image_dimensions`: PNG is still hand-parsed (it is
+  what `save_png` writes), everything else falls back to
+  `image::guess_format`. Header-only, so the launch scan stays cheap.
+- New `watch.rs` holds a non-recursive inotify watch on the Pictures folder and
+  runs `import_existing` + `indexer::poke()` once the folder goes quiet
+  (`SETTLE` = 400 ms), coalescing the several writes a clipboard save performs
+  into one directory scan.
+
+Two limits remain, both structural rather than oversight:
+
+- The watcher only sees the **default** Pictures folder. Settings live in the
+  webview's `localStorage` and Rust holds no state, so a custom save folder is
+  still only reconciled when `importExisting(dir)` re-runs on folder change.
+- A file that **overwrites an existing path** with new pixels keeps its old row:
+  `ON CONFLICT(path) DO NOTHING` skips it, and `pending()` sees a non-NULL
+  `ocr_boxes`/`embedded_at`, so the new content is never OCR'd or embedded.
+  Deleting the row and re-importing is the only recovery.
+
+Covered by `db::tests::indexable_extensions_cover_what_clipboards_produce`,
+`db::tests::import_indexes_a_pasted_jpeg_but_not_an_avif` (asserts the JPEG's
+48x24 dimensions come from its header, so it proves the decode path and not just
+the filter), and `watch::tests::settle_window_outlives_a_multistep_write`.
 
 ### BM6. Nothing reconciles the database against the filesystem — **Fixed**
 

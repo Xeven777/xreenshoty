@@ -55,6 +55,25 @@ Three traps, each of which looks like a different bug:
 
 Ollama cannot be used for this model at all: its `/api/embed` is text-only.
 
+- **N image parts in ONE request = one pooled vector. Video embeddings work.**
+  Verified on this box (b11541, `--pooling mean`): `input[0].content` accepts N
+  `image_url` parts and returns **one** 768-d vector, not N. All frames
+  contribute — cos(multi, each single frame) was 0.79/0.80/0.82/0.86, so the
+  pooled vector matches no individual frame. Subsets differ too
+  (cos[1,2] vs [1,2,3,4] = 0.92). That is the check that matters: N parts
+  yielding a vector identical to frame 1 would mean silent frame-dropping, the
+  same bug class as `/embedding`'s image-dropping.
+  **Cost is linear in frames:** 1f = 1.01s, 2f = 1.99s, 4f = 4.16s, 8f = 8.79s
+  (~1.1s/frame on the Arc). A 5-min video at 1 frame/10s = 30 frames ≈ 33s. So
+  frame sampling is the knob that decides whether video indexing is viable; it
+  is a throughput budget, not a quality dial.
+  Video needs no model change — only ffmpeg frame extraction in front of the
+  existing `embed_image` path. llama.cpp #30082 (server can't reach the
+  encoders) was **closed as invalid**; its author was using the shallow shape
+  that AGENTS.md already warns about.
+- **Stills stay one-image-per-request.** Video pooling changes nothing about
+  how stills embed: `embed_image` sends one part, gets one vector, as today.
+
 - **An empty `ocr_text` is a finished OCR, not a pending one.** Keying
   "needs OCR" off `ocr_text` re-processes text-free screenshots (74 of the 370
   here) on every pass forever. It keys off `ocr_boxes`, which is always written
@@ -142,6 +161,30 @@ Ollama cannot be used for this model at all: its `/api/embed` is text-only.
   "needs OCR" off `ocr_text` re-processes text-free screenshots (black regions,
   dark desktops) on every pass forever. It keys off `ocr_boxes`, which is always
   written (`[]` when nothing was found) and so records "attempted".
+- **Two gates decide whether a file gets indexed, and both must be widened.**
+  `is_indexable_image` (extension) and `image_dimensions` (header) are separate
+  checks in `import_existing`. `image_dimensions` originally only parsed a PNG
+  IHDR, so widening the extension list alone changed nothing — every JPEG still
+  fell through. It now hand-parses PNG and falls back to
+  `image::guess_format` for JPEG/WebP/GIF.
+- **llama.cpp ignores the data-URL MIME label.** `embed_image` labels every
+  payload `image/png`, and that is inert: the same JPEG sent as `image/png` and
+  as `image/jpeg` returns cos = 1.000000, because the format is sniffed from the
+  bytes. So a pasted JPEG is embedded correctly with no re-encoding. Do not add
+  a per-extension MIME map without re-measuring.
+- **AVIF is deliberately not indexed.** `image` 0.24 gates AVIF behind
+  `avif-decoder`, which needs the `dav1d` crate; that builds dav1d from source
+  and requires meson + nasm, neither of which is installed here. The system
+  `libdav1d` 1.5.1 *is* installed (ffmpeg uses it), so AVIF is a link-against-
+  system-dav1d build script away — but indexing a format `thumbnail` cannot
+  decode would create a permanently broken row, so it stays out until the decode
+  path exists too. Same reasoning excludes tiff and bmp.
+- **The save folder is watched, not polled.** `watch.rs` holds a non-recursive
+  inotify watch on the Pictures folder and runs `import_existing` + `poke()`
+  once the folder goes quiet (`SETTLE` = 400 ms), coalescing the several writes a
+  clipboard save performs into one directory scan. It cannot see a *custom* save
+  folder: settings live in the webview's `localStorage` and Rust holds no state,
+  so a custom folder still relies on `importExisting(dir)` re-running on change.
 - **The indexer must chain on work done, not row count.** A full batch whose
   rows could not be processed (model still loading) returns identically on the
   next query, so re-notifying on `rows.len()` spins the worker in a tight loop
@@ -170,6 +213,16 @@ Ollama cannot be used for this model at all: its `/api/embed` is text-only.
   rate.
 - **The thumbnail loader is shared.** `useThumbnails` in `src/lib/use-thumbnails.ts`
   backs both the history grid and search results; do not re-inline the worker pool.
+- **Clearing the thumbnail cache needs both caches.** Settings → Clear wipes the
+  on-disk PNGs under `~/.cache/xreenshoty/thumbs` (`clear_thumbnail_cache`) *and*
+  the two module-level `Map`s in `use-thumbnails.ts` (`clearMemoryCaches`). Disk
+  only looks like a no-op: the maps still hold every URL the session loaded, so
+  nothing re-requests. Mounted grids keep their own state and only refill on the
+  next path change, so on-screen tiles do not visibly rebuild — that is
+  expected, not a failure.
+- **`clear_cache_in`/`cache_size_in` take the dir as a parameter** precisely so
+  the test does not call the commands. Those target the real `~/.cache`; a test
+  invoking them would delete the user's actual thumbnails.
 - **Indexing never blocks capture.** `save_png` writes the row and calls
   `indexer::poke()`, which only wakes the worker. `indexer::APP` is a module-level
   `OnceLock<AppHandle>` so capture commands do not need one just to forward it.

@@ -304,12 +304,19 @@ impl Embedder {
             .collect()
     }
 
-    /// Embed a raw PNG. Images carry no task prefix -- the model was trained
-    /// with prefixes for text only.
+    /// Embed an image file's raw bytes (PNG today, plus JPEG/WebP/GIF once
+    /// `import_existing` admits them).
     ///
     /// One image per request deliberately: sending 8 in a single call measured
     /// 0.96x versus sequential, because the GPU is already saturated and the
     /// batched response cannot return until the slowest of the 8 is done.
+    ///
+    /// The bytes are passed through unmodified. The data URL below is *labelled*
+    /// `image/png`, and llama.cpp sniffs the real format from the bytes rather
+    /// than trusting that label: verified on this box, the same JPEG sent as
+    /// `image/png` and as `image/jpeg` produced cos = 1.000000. So a pasted JPEG
+    /// needs no re-encoding before embedding. Do not "fix" this into a
+    /// per-extension MIME map without re-measuring — the label is inert.
     pub fn embed_image(&self, png: &[u8]) -> Result<Vec<f32>, String> {
         self.post(vec![image_input(png)])?
             .pop()

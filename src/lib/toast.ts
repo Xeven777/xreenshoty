@@ -1,6 +1,6 @@
 import { toast } from "sonner"
 
-import { fileName } from "./utils"
+import { fileName, formatBytes } from "./utils"
 
 /** Consistent in-app toast copy. OS notifications stay in `notify.ts` for
  *  background saves; these are for foreground feedback that survives tab
@@ -34,6 +34,12 @@ export function toastFailed(title: string, error: unknown, retry?: () => void) {
 
 export function toastCopied() {
   toast.success("Copied to clipboard")
+}
+
+export function toastCacheCleared(bytes: number) {
+  toast.success("Thumbnail cache cleared", {
+    description: `${formatBytes(bytes)} freed — thumbnails rebuild as you scroll`,
+  })
 }
 
 export { toast }

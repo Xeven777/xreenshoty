@@ -1,8 +1,8 @@
 [package]
 name = "tauri-native"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Local-first screenshots you can actually find again. Fully offline."
+authors = ["Anish"]
 edition = "2021"
 
 # `src/bin/dbcheck` is a read-only inspector for the screenshot DB. With two
@@ -38,6 +38,7 @@ tokio = { version = "1", features = ["macros", "rt", "time"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 sqlite-vec = "0.1.9"
 ureq = { version = "3.4.2", default-features = false }
+notify = { version = "6", default-features = false, features = ["macos_fsevent"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = "0.13"
