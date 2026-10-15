@@ -1,15 +1,40 @@
 <div align="center">
-<img src="./public/logo.svg" width="100" />
-<h1>xreenshoty</h1>
+  <img src="./public/logo.svg" width="130" alt="xreenshoty logo" />
+  <h1>xreenshoty</h1>
+  <p>
+    <b>📸 Local-first screenshots you can actually find again.</b><br />
+    Capture on X11 · search by <i>text</i> or <i>vibe</i> · every byte stays on your machine.
+  </p>
+  <p>
+    <a href="#features">Features</a> ·
+    <a href="#demo">Demo</a> ·
+    <a href="#how-it-works">How it works</a> ·
+    <a href="#stack">Stack</a> ·
+    <a href="#-quickstart">Quickstart</a> ·
+    <a href="#project-status">Status</a>
+  </p>
+  <p>
+    <img src="https://img.shields.io/badge/offline-100%25-2eb886?style=flat-square" alt="offline" />
+    <img src="https://img.shields.io/badge/Tauri-2-24C8DB?style=flat-square&logo=tauri&logoColor=white" alt="Tauri 2" />
+    <img src="https://img.shields.io/badge/Rust-stable-000000?style=flat-square&logo=rust&logoColor=white" alt="Rust" />
+    <img src="https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=20232A" alt="React 19" />
+    <img src="https://img.shields.io/badge/Tailwind-4-38B2AC?style=flat-square&logo=tailwindcss&logoColor=white" alt="Tailwind 4" />
+    <img src="https://img.shields.io/badge/Bun-1.x-000000?style=flat-square&logo=bun&logoColor=white" alt="Bun" />
+    <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT license" />
+  </p>
+  <p>
+    <img src="https://img.shields.io/badge/search-FTS5%20%2B%20sqlite--vec%20cosine-FFA500?style=flat-square&logo=sqlite&logoColor=white" alt="SQLite FTS5 + sqlite-vec" />
+    <img src="https://img.shields.io/badge/OCR-tesseract%205.5-CC0000?style=flat-square" alt="tesseract 5.5" />
+    <img src="https://img.shields.io/badge/embeddings-EmbeddingGemma%202%20%C2%B7%20768--d-B68A36?style=flat-square" alt="EmbeddingGemma 2 768-d" />
+    <img src="https://img.shields.io/badge/GPU-Vulkan%20%2B%20llama--server-B71C1C?style=flat-square&logo=vulkan&logoColor=white" alt="Vulkan + llama-server" />
+    <img src="https://img.shields.io/badge/voice-Whistle%20local%20STT-E0483E?style=flat-square" alt="Whistle local speech-to-text" />
+    <img src="https://img.shields.io/badge/platform-Linux%20%C2%B7%20X11%20%C2%B7%20XFCE-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux X11 XFCE" />
+  </p>
 </div>
 
-📸 Local-first screenshots you can actually find again. Fully offline.
+**Stop scrolling through 370 files named `Screenshot_2026-03-14.png`.** xreenshoty captures your Linux desktop, reads the text in every shot, embeds what each shot looks like, and lets you search both at once — with BM25 and cosine k-NN fused into a single score. No cloud. No account. Nothing leaves the machine.
 
-![offline](https://img.shields.io/badge/offline-100%25-brightgreen) ![Tauri 2](https://img.shields.io/badge/Tauri-2-blue) ![React 19](https://img.shields.io/badge/React-19-61dafb) ![SQLite + sqlite-vec](https://img.shields.io/badge/search-FTS5%20%2B%20vec0-orange) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
-
-Stop scrolling through 370 files named `Screenshot_2026-03-14.png`. xreenshoty captures your Linux desktop, reads the text in every shot, embeds what each shot looks like, and lets you search both at once. No cloud. No account. Nothing leaves the machine.
-
-The files stay yours. PNGs live in `~/Pictures`. SQLite at `~/.local/share/xreenshoty/screenshots.db` holds metadata only. Delete the DB and the indexer rebuilds it from the PNGs.
+The files stay yours. Images live in your save folder (`~/Pictures` by default, any folder you like in Settings). SQLite at `~/.local/share/xreenshoty/screenshots.db` holds metadata only. Delete the DB and the indexer rebuilds it from the images.
 
 ## Features
 
@@ -23,9 +48,11 @@ Why xreenshoty hits different ✨
 
 🔒 **Offline to the bone** tesseract, llama-server, SQLite, and sqlite-vec all run on your box. No cloud, no account, no telemetry, no "sign in to continue". Pull the network cable and everything still works.
 
-🗂️ **Your files stay yours** PNGs live in `~/Pictures`, the DB is metadata only. Delete the DB and the indexer rebuilds it from the PNGs. A database bug can never eat a screenshot.
+🗂️ **Your files stay yours** images live in your save folder, the DB is metadata only. Delete the DB and the indexer rebuilds it from the images. A database bug can never eat a screenshot.
 
-👁️ **Buttery viewer** history grid plus search share the same thumbnail pool and shot tiles. One click opens the full-size in-app viewer, one more hands the original PNG to xdg-open. Thumbnails stream from Rust as base64 so any save folder just works.
+📁 **Watch any folder** add extra folders in Settings and inotify watches each one. A file dropped from another app is imported ~400 ms after the folder goes quiet — PNG, JPEG, WebP and GIF. Remove the folder and the watch stops with it.
+
+👁️ **Buttery viewer** history grid plus search share the same thumbnail pool and shot tiles. One click opens the full-size in-app viewer, one more hands the original image to xdg-open. Thumbnails stream from Rust as base64 so any save folder just works. Settings shows the on-disk cache size and clears it, memory pools included.
 
 🎙️ **Push-to-talk voice search** hold the mic, say what you are looking for, Whistle transcribes it locally through an isolated venv. No Python in the main path, no audio ever leaves the machine.
 
@@ -33,29 +60,99 @@ Why xreenshoty hits different ✨
 
 ## Demo
 
-30 seconds, end to end.
+9 seconds, end to end.
 
 1. 📸 Press your shortcut. Grab fullscreen, active window, or drag a region.
-2. 💾 The shot lands in Pictures and the indexer wakes in the background.
-3. 🔍 Type what you remember, text or visual.
-4. 🎯 One cosine score per tile, one click to full size.
+2. 💾 The shot lands in your save folder and the indexer wakes in the background.
+3. 🔍 Type what you remember, text or visual — or just say it.
+4. 🎯 One similarity score per tile, one click to full size.
 
-Record a 30 second GIF of steps 1 to 4 and drop it at `./docs/demo.gif`.
-
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/23552bee-4b71-4124-9721-548165ae23bf" controls autoplay loop muted playsinline width="720" alt="xreenshoty demo"></video>
+  <p><sub>9 seconds — capture → OCR + embed → hybrid search → open.</sub></p>
+</div>
 
 ## How it works
 
-```text
-capture --> OCR --> embed --> FTS5 + vec0 --> hybrid fuse --> answer
-  |         |        |             |                |              |
-X11 shot  tesseract EmbeddingGemma SQLite holds   min-max       Tauri UI
-screenshots 5.5 OCR  2 768-d      text + vectors  0.44 text /
-crop from   boxes +  llama-server in one row      0.56 visual
-frozen      text      Vulkan GPU                   RRF optional
-backdrop
+```mermaid
+flowchart LR
+    classDef capture fill:#1d4ed8,stroke:#93c5fd,color:#fff
+    classDef pipe fill:#b45309,stroke:#fcd34d,color:#fff
+    classDef store fill:#6d28d9,stroke:#c4b5fd,color:#fff
+    classDef search fill:#0f766e,stroke:#5eead4,color:#fff
+    classDef plain fill:#1e293b,stroke:#94a3b8,color:#fff
+    classDef out fill:#be123c,stroke:#fda4af,color:#fff
+
+    subgraph CAP["📸 Capture — X11, one funnel"]
+        direction TB
+        KS["⌨️ Global shortcuts<br/>delay · cancel · history"]
+        FS["Fullscreen"]
+        WIN["Active window<br/>_NET_ACTIVE_WINDOW"]
+        REG["Drag-a-region<br/>frozen backdrop"]
+        KS --> FS
+        KS --> WIN
+        KS --> REG
+    end
+
+    subgraph WATCH["👁️ Watched folders — inotify"]
+        DIRS["Save folder + any folder you add<br/>PNG · JPEG · WebP · GIF<br/>quiet for 400 ms → auto-import"]
+    end
+
+    SAVE["💾 save_png — every mode calls it<br/>writes the image, pokes the worker"]
+    ROW["🗄️ SQLite row<br/>path · size · ocr_boxes"]
+
+    FS --> SAVE
+    WIN --> SAVE
+    REG --> SAVE
+    SAVE --> ROW
+    DIRS --> ROW
+
+    subgraph BG["⚙️ Background worker — capture never waits"]
+        direction TB
+        OCR["🔤 tesseract 5.5 OCR<br/>4 workers · text + boxes"]
+        EMB["🎮 llama-server · /v1/embeddings<br/>EmbeddingGemma 2 · 768-d · Vulkan"]
+        TX["One transaction<br/>FTS5 rows + vec0 rows"]
+        OCR --> EMB --> TX
+    end
+
+    ROW --> OCR
+
+    subgraph DB["🗄️ SQLite — metadata only, rebuildable from the files"]
+        direction TB
+        FTS[("FTS5<br/>BM25 over OCR text")]
+        VEC[("vec0<br/>cosine k-NN over 768-d")]
+    end
+
+    TX --> FTS
+    TX --> VEC
+
+    subgraph SEARCH["🔍 Search — two arms, one score"]
+        direction TB
+        Q["Query: typed or 🎙️ push-to-talk<br/>Whistle in an isolated venv"]
+        A1["Text arm · BM25 0–30"]
+        A2["Visual arm · cosine distance"]
+        NM["min-max rescale each arm<br/>a missing arm takes its floor"]
+        BL["Blend 0.44 text / 0.56 visual<br/>RRF behind XREENSHOTY_FUSION"]
+        Q --> A1
+        Q --> A2
+        A1 --> NM
+        A2 --> NM
+        NM --> BL
+    end
+
+    FTS --> A1
+    VEC --> A2
+    BL --> OUT["🎯 Top hits → grid → in-app viewer → xdg-open"]
+
+    class KS,FS,WIN,REG capture
+    class SAVE,ROW,DIRS plain
+    class OCR,EMB,TX pipe
+    class FTS,VEC store
+    class Q,A1,A2,NM,BL search
+    class OUT out
 ```
 
-Capture funnels through one function. Every mode calls `save_png`, which writes the row and pokes the worker. The worker OCRs with tesseract, embeds with EmbeddingGemma 2 over local HTTP, and writes FTS5 rows plus vec0 rows in one transaction.
+Capture funnels through one function. Every mode calls `save_png`, which writes the row and pokes the worker. The worker OCRs with tesseract, embeds with EmbeddingGemma 2 over local HTTP, and writes FTS5 rows plus vec0 rows in one transaction. Watched folders skip capture entirely: inotify fires once a folder goes quiet, and `import_existing` writes the same row shape, so a screenshot pasted in from another app is searchable too.
 
 Search runs two arms and fuses them. BM25 scans OCR text. k-NN scans image vectors with cosine distance. Each arm rescales with min-max, then blends 0.44 text and 0.56 visual. A doc missing from one arm takes that arm floor value, so text-free screenshots stay findable. Scores print as one number. The bar and the label read from the same value.
 
@@ -77,15 +174,20 @@ Real timings from the dev box, Intel Arc A530M plus UHD 770 iGPU, 370 screenshot
 
 ## Stack
 
+No toy stack — every piece runs on your box and pulls its weight.
+
 | Concern        | Choice                                | Notes                                                       |
 | -------------- | ------------------------------------- | ----------------------------------------------------------- |
 | Desktop        | Tauri 2, React 19, Tailwind 4         | Local app, no server component                              |
+| Backend        | Rust, bundled SQLite via rusqlite     | One binary, one DB file, no system SQLite needed            |
 | Capture        | screenshots 0.8 on X11                | xcap waits until MX repos sync libpipewire dev              |
-| Files          | ~/Pictures                            | Source of truth                                             |
+| Files          | Save folder, `~/Pictures` default    | Source of truth, any folder watchable |
+| Watching       | inotify in Rust                       | Non-recursive, 400 ms settle, remove the folder, lose the watch |
+| Thumbnails     | Rust, streamed as base64              | Disk cache + memory pool, size shown and clearable in Settings |
 | Metadata       | rusqlite with bundled SQLite          | Single file, idempotent schema                              |
 | Keyword search | FTS5                                  | Terms are split and quoted so operators cannot break syntax |
-| OCR            | tesseract 5.5.0                       | CPU only, starts in milliseconds                            |
-| Embeddings     | EmbeddingGemma 2 through llama-server | 768-d, Vulkan backend, mean pooling                         |
+| OCR            | tesseract 5.5.0, 4 workers            | CPU only, starts in milliseconds                            |
+| Embeddings     | EmbeddingGemma 2 through llama-server | 768-d, Vulkan backend, mean pooling, auto GPU pick          |
 | Vectors        | sqlite-vec vec0 with cosine metric    | Text and vectors live in one transaction                    |
 | Voice          | Whistle 16.9 MB via cactus-needle     | Push to talk, isolated venv, milestone 6 only               |
 
@@ -109,7 +211,7 @@ System packages.
 - 🟢 Bun (frontend package manager, `bun install` then `bun run tauri dev`)
 - 🔤 tesseract 5 with `eng` data (`tesseract --version`, `eng.traineddata` present)
 - 🎮 Vulkan drivers + `vulkaninfo` (GPU auto-pick needs it, Intel Arc A530M tested on Mesa 25.0.7)
-- 🎤 `pw-record` or `arecord` for voice input, `xdg-open` for opening PNGs
+- 🎤 `pw-record` or `arecord` for voice input, `xdg-open` for opening images
 
 Models (all local, all yours).
 
@@ -159,14 +261,10 @@ XREENSHOTY_TEST_DB=/tmp/test.db  # keep tests off your real index
 
 ## Project status
 
-Done. Capture for fullscreen, window, and region. SQLite index with import on launch. OCR backfill. Image embeddings on dGPU. Hybrid search with fusion tests. History grid, search UI, shared thumbnails, in-app viewer, global shortcuts, voice push to talk.
+Done. Capture for fullscreen, window, and region. SQLite index with import on launch. OCR backfill. Image embeddings on dGPU. Hybrid search with fusion tests. History grid, search UI, shared thumbnails, in-app viewer, global shortcuts, voice push to talk. Multi-folder watching with inotify auto-import, JPEG/WebP/GIF indexing, thumbnail cache with size + clear in Settings, pausable indexer.
 
 Next. Answer synthesis from top 6 hits through a local 1B model, then rerank only if the eval set proves top 10 holds answers that top 3 misses.
 
 ## Contributing
 
-Issues and PRs welcome. Run typecheck and lint before you push. Keep capture off the inference path, keep PNGs as source of truth, and add a test when you touch fusion or schema code.
-
-## License
-
-MIT. Built offline on Linux, for people who take a lot of screenshots.
+Issues and PRs welcome. Run typecheck and lint before you push. Keep capture off the inference path, keep images as source of truth, and add a test when you touch fusion or schema code.

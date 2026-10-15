@@ -11,14 +11,12 @@ import { ExternalLinkGuard } from "./components/external-link-guard.tsx"
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    {/* Every motion component honours the OS "reduce motion" setting. The CSS
-        animations have their own media query; this covers the JS-driven ones
-        (preview spring, card rise, countdown roll, voice pulse). */}
     <MotionConfig reducedMotion="user">
       <ThemeProvider>
         <ExternalLinkGuard />
         {/*{import.meta.env.DEV ? <DebugPanel /> : null}*/}
-        <main data-ui-scroll-container>
+        <main data-ui-scroll-container className="relative">
+          <div className="absolute rotate-180 z-[-2] h-screen w-screen bg-transparent bg-[radial-gradient(ellipse_80%_80%_at_50%_-20%,rgba(240,111,200,0.2),rgba(255,255,255,0))]"></div>
           <App />
         </main>
         <AppToaster />

@@ -597,9 +597,6 @@ export function Capture({
               size="xs"
               variant="ghost"
               onClick={() => {
-                // Only the list is cleared. The thumbnail cache is keyed by
-                // path inside the hook, so it stays valid and re-showing the
-                // same screenshot costs nothing.
                 setHistory([])
               }}
             >
@@ -617,10 +614,6 @@ export function Capture({
           </div>
         ) : (
           <div className="shot-grid grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-            {/* AnimatePresence renders no DOM of its own, so the cards stay
-                direct grid children while its direct children (the cards) are
-                what gets exit-animated. popLayout pops the leaving card out of
-                flow instead of leaving a gap. */}
             <AnimatePresence mode="popLayout" initial={false}>
               {history.map((item, i) => (
                 <ShotCard

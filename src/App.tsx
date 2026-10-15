@@ -18,7 +18,7 @@ export default function App() {
         <img
           src="/logo.svg"
           alt="xreenshoty logo"
-          className="size-12 shrink-0 rounded-md shadow-sm transition-transform duration-300 hover:scale-102 active:scale-95 active:rotate-2"
+          className="size-12 shrink-0 rounded-md shadow-[0_0_20px_rgb(198,0,91,0.3)] transition-transform duration-300 hover:scale-102 active:scale-95 active:rotate-2"
         />
         <div className="min-w-0 flex-1">
           <h1 className="text-2xl font-semibold tracking-tight">xreenshoty</h1>
