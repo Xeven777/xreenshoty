@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from "react"
 
 export interface Settings {
   saveDir: string
+  /** Extra folders to watch for images, on top of `saveDir`. */
+  scanFolders: string[]
   delaySecs: number
   shortcutFullscreen: string
   shortcutWindow: string
@@ -12,6 +14,7 @@ const KEY = "xreenshoty.settings"
 
 export const DEFAULT_SETTINGS: Settings = {
   saveDir: "",
+  scanFolders: [],
   delaySecs: 0,
   shortcutFullscreen: "Control+Shift+S",
   shortcutWindow: "Control+Shift+W",
@@ -25,12 +28,22 @@ function clampDelay(value: number) {
   return Math.min(MAX_DELAY, Math.max(0, Math.round(value)))
 }
 
+/** Stored settings are user-editable and may predate a field, so coerce rather
+ *  than trust. A `scanFolders` that is not an array of strings would otherwise
+ *  reach `.map` and break the whole Settings tab. */
+function sanitise(stored: Partial<Settings>): Settings {
+  const scanFolders = Array.isArray(stored.scanFolders)
+    ? stored.scanFolders.filter((d): d is string => typeof d === "string")
+    : DEFAULT_SETTINGS.scanFolders
+  return { ...DEFAULT_SETTINGS, ...stored, scanFolders }
+}
+
 export function useSettings() {
   const [settings, setSettings] = useState<Settings>(() => {
     try {
       const raw = localStorage.getItem(KEY)
       if (!raw) return DEFAULT_SETTINGS
-      return { ...DEFAULT_SETTINGS, ...(JSON.parse(raw) as Partial<Settings>) }
+      return sanitise(JSON.parse(raw) as Partial<Settings>)
     } catch {
       return DEFAULT_SETTINGS
     }

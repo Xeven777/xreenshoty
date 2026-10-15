@@ -819,18 +819,40 @@ change, so a paste mid-session waited for a restart.
 
 Two limits remain, both structural rather than oversight:
 
-- The watcher only sees the **default** Pictures folder. Settings live in the
-  webview's `localStorage` and Rust holds no state, so a custom save folder is
-  still only reconciled when `importExisting(dir)` re-runs on folder change.
+- **Non-recursive**, matching the save folder's own behaviour. A watched folder's
+  subfolders are not scanned.
 - A file that **overwrites an existing path** with new pixels keeps its old row:
   `ON CONFLICT(path) DO NOTHING` skips it, and `pending()` sees a non-NULL
   `ocr_boxes`/`embedded_at`, so the new content is never OCR'd or embedded.
-  Deleting the row and re-importing is the only recovery.
+  Multiple watched folders make this likelier — the same image reachable from
+  two of them. Deleting the row and re-importing is the only recovery.
 
 Covered by `db::tests::indexable_extensions_cover_what_clipboards_produce`,
 `db::tests::import_indexes_a_pasted_jpeg_but_not_an_avif` (asserts the JPEG's
 48x24 dimensions come from its header, so it proves the decode path and not just
 the filter), and `watch::tests::settle_window_outlives_a_multistep_write`.
+
+### BM8. Only one folder was ever scanned — **Fixed**
+
+`import_existing(dir)` and the watcher were both single-path, so Downloads or a
+shared drive stayed invisible. Settings → **Watched folders** now holds a list
+(`settings.scanFolders`) pushed to Rust via `set_scan_folders`, and
+`watch::sync(&dirs)` makes the registry match exactly.
+
+Two things that are easy to get wrong here, both now unit-tested:
+
+- **Duplicate watches.** `/x/Pics` and `/x/Pics/` are the same directory and
+  inotify accepts both, so every event would fire the reconcile twice. `sync`
+  canonicalises its keys before comparing.
+- **Empty strings.** An empty path canonicalises to the **CWD**, which would
+  silently watch the whole working directory. Blank entries are dropped first.
+
+One bad folder must not cost the others: a path that is not a directory is
+logged and skipped, and `set_scan_folders` returns the count actually watched so
+the UI can say so.
+
+Covered by `watch::tests::sync_adds_folders_and_drops_removed_ones` and
+`watch::tests::sync_skips_folders_that_do_not_exist`.
 
 ### BM6. Nothing reconciles the database against the filesystem — **Fixed**
 

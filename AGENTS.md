@@ -179,12 +179,17 @@ Ollama cannot be used for this model at all: its `/api/embed` is text-only.
   system-dav1d build script away — but indexing a format `thumbnail` cannot
   decode would create a permanently broken row, so it stays out until the decode
   path exists too. Same reasoning excludes tiff and bmp.
-- **The save folder is watched, not polled.** `watch.rs` holds a non-recursive
-  inotify watch on the Pictures folder and runs `import_existing` + `poke()`
-  once the folder goes quiet (`SETTLE` = 400 ms), coalescing the several writes a
-  clipboard save performs into one directory scan. It cannot see a *custom* save
-  folder: settings live in the webview's `localStorage` and Rust holds no state,
-  so a custom folder still relies on `importExisting(dir)` re-running on change.
+- **Folders are watched, not polled.** `watch.rs` holds a non-recursive inotify
+  watch per folder and runs `import_existing` + `poke()` once the folder goes
+  quiet (`SETTLE` = 400 ms), coalescing the several writes a clipboard save
+  performs into one directory scan. `sync(&dirs)` is the only way in and makes
+  the watched set exactly match its argument, so adding and removing a folder in
+  Settings take the same path as startup. Keys are canonicalised: `/x/Pics` and
+  `/x/Pics/` are one watch, not two.
+  At startup Rust can only seed the **default** Pictures folder — settings live
+  in the webview's `localStorage` and Rust holds no state — so the frontend calls
+  `set_scan_folders` with the real list once settings load and on every change. A
+  custom `saveDir` therefore depends on that first call landing.
 - **The indexer must chain on work done, not row count.** A full batch whose
   rows could not be processed (model still loading) returns identically on the
   next query, so re-notifying on `rows.len()` spins the worker in a tight loop

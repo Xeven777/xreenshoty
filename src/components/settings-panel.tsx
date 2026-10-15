@@ -5,9 +5,11 @@ import {
   Broom,
   Check,
   FolderOpen,
+  FolderPlus,
   Keyboard,
   Minus,
   Plus,
+  Trash,
   Warning,
   X,
 } from "@phosphor-icons/react"
@@ -20,13 +22,13 @@ import {
   clearThumbnailCache,
   getDefaultSaveDir,
   openFolderSafe,
+  setScanFolders,
   thumbnailCacheSize,
 } from "@/lib/screenshot"
 import { eventToAccelerator, prettyAccelerator } from "@/lib/shortcuts"
 import { clearMemoryCaches } from "@/lib/use-thumbnails"
 import { toastCacheCleared, toastFailed, toast } from "@/lib/toast"
 import { formatBytes } from "@/lib/utils"
-
 export function SettingsPanel({
   settings,
   update,
@@ -42,6 +44,7 @@ export function SettingsPanel({
   >(null)
   const [cacheBytes, setCacheBytes] = useState<number | null>(null)
   const [clearing, setClearing] = useState(false)
+  const [newFolder, setNewFolder] = useState("")
 
   // The cache size is only read when the tab is mounted, so the number stays
   // honest for as long as Settings is open.
@@ -72,6 +75,46 @@ export function SettingsPanel({
     } finally {
       setClearing(false)
     }
+  }
+
+  const scanFolders = settings.scanFolders
+
+  /** Push the list to Rust on every change: the watcher registry is replaced to
+   *  match, so removing a folder really stops the watch rather than just hiding
+   *  it from the UI. `saveDir` is deliberately excluded — it is watched as the
+   *  capture destination and lives in its own setting. */
+  async function applyScanFolders(next: string[]) {
+    update("scanFolders", next)
+    try {
+      const watched = await setScanFolders(next)
+      if (watched < next.length) {
+        toast.error("A folder was skipped", {
+          description: "Only existing directories can be watched.",
+        })
+      }
+    } catch (error) {
+      toastFailed("Could not update watched folders", error, () =>
+        void applyScanFolders(next)
+      )
+    }
+  }
+
+  function addScanFolder() {
+    const dir = newFolder.trim()
+    if (!dir) return
+    // Deduplicate, or the same path shows twice and Rust canonicalises both to
+    // one watch anyway.
+    if (scanFolders.includes(dir)) {
+      toast.error("Already in the list")
+      setNewFolder("")
+      return
+    }
+    void applyScanFolders([...scanFolders, dir])
+    setNewFolder("")
+  }
+
+  function removeScanFolder(dir: string) {
+    void applyScanFolders(scanFolders.filter((d) => d !== dir))
   }
 
   // The banner lives in this tab only; a toast reaches the user wherever they
@@ -309,6 +352,81 @@ export function SettingsPanel({
           Only these cached copies are removed. Your PNGs, OCR text and search
           results are untouched — thumbnails rebuild from the originals as you
           scroll.
+        </p>
+        {!tauri ? (
+          <Badge variant="secondary">Needs the desktop shell</Badge>
+        ) : null}
+      </section>
+
+      <section className="space-y-4 rounded-2xl border bg-card p-5 shadow-sm">
+        <header className="flex items-center gap-2.5">
+          <FolderPlus size={18} className="text-muted-foreground" />
+          <div>
+            <h2 className="font-medium">Watched folders</h2>
+            <p className="text-xs text-muted-foreground">
+              Extra places to look for images, besides where captures are saved
+            </p>
+          </div>
+        </header>
+
+        <ul className="space-y-2">
+          {scanFolders.length === 0 ? (
+            <li className="text-sm text-muted-foreground">
+              None yet — only {settings.saveDir.trim() || "Pictures"} is
+              watched.
+            </li>
+          ) : (
+            scanFolders.map((dir) => (
+              <li
+                key={dir}
+                className="flex items-center gap-2 rounded-xl border bg-background px-3 py-2"
+              >
+                <FolderOpen
+                  size={16}
+                  className="shrink-0 text-muted-foreground"
+                />
+                <span className="min-w-0 flex-1 truncate text-sm" title={dir}>
+                  {dir}
+                </span>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="size-7 shrink-0"
+                  title="Stop watching"
+                  disabled={!tauri}
+                  onClick={() => removeScanFolder(dir)}
+                >
+                  <Trash />
+                </Button>
+              </li>
+            ))
+          )}
+        </ul>
+
+        <div className="flex gap-2">
+          <Input
+            value={newFolder}
+            onChange={(e) => setNewFolder(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") addScanFolder()
+            }}
+            placeholder="/home/you/Downloads"
+            disabled={!tauri}
+            className="ui-selectable"
+          />
+          <Button
+            variant="secondary"
+            disabled={!tauri || !newFolder.trim()}
+            onClick={addScanFolder}
+          >
+            <FolderPlus data-icon="inline-start" />
+            Add
+          </Button>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Only png, jpg, jpeg, webp and gif files are indexed. Subfolders are
+          not scanned. The folder must already exist — this app never creates
+          directories you did not ask for.
         </p>
         {!tauri ? (
           <Badge variant="secondary">Needs the desktop shell</Badge>

@@ -134,6 +134,13 @@ export function importExisting(dir: string | null) {
   return trackedInvoke<number>("import_existing", { dir })
 }
 
+/** Set the folders watched for images dropped in from outside the app, and
+ *  index each one immediately. Returns how many are now watched — a path that
+ *  is not an existing directory is skipped, so this can be fewer than asked. */
+export function setScanFolders(dirs: string[]) {
+  return trackedInvoke<number>("set_scan_folders", { dirs })
+}
+
 /** Bytes held by the on-disk thumbnail cache. */
 export function thumbnailCacheSize() {
   return trackedInvoke<number>("thumbnail_cache_size")

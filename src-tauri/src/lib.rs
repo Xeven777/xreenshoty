@@ -39,31 +39,25 @@ fn external_navigation_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-/// Watch the save folder for files that appear from outside the app.
+/// Watch folders so files that appear from outside the app are indexed.
 ///
 /// A pasted or dragged-in image never calls `save_png`, so nothing poked the
-/// indexer and the file stayed invisible to search until the next launch. The
-/// watcher runs `import_existing` + `poke` whenever the folder goes quiet, which
-/// is the same reconciliation the launch path performs.
+/// indexer and the file stayed invisible to search. The watcher runs
+/// `import_existing` + `poke` whenever a folder goes quiet, which is the same
+/// reconciliation the launch path performs.
 ///
-/// Rust holds no settings state (`AGENTS.md`): the folder lives in the
-/// webview's `localStorage`. At startup we cannot read it, so this watches the
-/// default Pictures folder; `importExisting(dir)` re-runs on every folder
-/// change from the frontend, which is what keeps a custom folder indexed.
+/// Rust holds no settings state (`AGENTS.md`): the folder list lives in the
+/// webview's `localStorage`. At startup we cannot read it, so this seeds the
+/// registry with the default Pictures folder only; the frontend calls
+/// `set_scan_folders` with the real list as soon as settings load, and again on
+/// every change. Seeding means behaviour before that first call matches the old
+/// single-folder watcher.
 ///
-/// Own thread rather than the async runtime: `watch::run` blocks for the life of
-/// the process, and holding an async worker on a blocking loop would starve the
-/// pool. Losing this thread degrades to launch-only indexing, never to a crash.
-fn spawn_folder_watch() {
-    let dir = screenshot::resolve_dir(None).map(|d| d.to_string_lossy().into_owned());
-    match dir {
+/// No thread is spawned here: each watch owns its own, started by `watch::sync`.
+fn seed_folder_watch() {
+    match screenshot::resolve_dir(None) {
         Ok(dir) => {
-            if let Err(e) = std::thread::Builder::new()
-                .name("folder-watch".into())
-                .spawn(move || watch::run(dir))
-            {
-                log::warn!("watch: could not spawn watcher: {e}");
-            }
+            watch::sync(&[dir.to_string_lossy().into_owned()]);
         }
         Err(e) => log::warn!("watch: no save folder to watch: {e}"),
     }
@@ -97,7 +91,7 @@ pub fn run() {
             app.handle()
                 .plugin(tauri_plugin_global_shortcut::Builder::new().build())?;
             indexer::Indexer::start(app.handle().clone());
-            spawn_folder_watch();
+            seed_folder_watch();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -126,6 +120,7 @@ pub fn run() {
             db::search_text,
             db::screenshot_detail,
             db::screenshot_count,
+            watch::set_scan_folders,
             voice::voice_start,
             voice::voice_stop,
             voice::voice_cancel

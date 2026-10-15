@@ -75,7 +75,7 @@ export function Capture({
   const [countdown, setCountdown] = useState<number | null>(null)
   const abortRef = useRef(false)
 
-  const { saveDir, delaySecs, notifyOnSave } = settings
+  const { saveDir, scanFolders, delaySecs, notifyOnSave } = settings
 
   // History comes from SQLite, so it survives restarts. Refreshed after every
   // capture rather than patched locally, to keep one source of truth.
@@ -133,6 +133,20 @@ export function Capture({
       await refresh()
     })()
   }, [tauri, saveDir, refresh])
+
+  // Adding or removing a watched folder changes what `list_recent` should
+  // return, so history has to be re-read. `set_scan_folders` is what actually
+  // registers the watch — this only re-renders the grid.
+  const appliedFolders = useRef("")
+  useEffect(() => {
+    if (!tauri) return
+    // Joined, not identity-compared: `settings` is recreated on every keystroke
+    // in the save-folder field, and this effect must not fire for that.
+    const key = JSON.stringify(scanFolders)
+    if (appliedFolders.current === key) return
+    appliedFolders.current = key
+    void refresh()
+  }, [tauri, scanFolders, refresh])
 
   const preview = usePreview()
   const thumbs = useThumbnails(
