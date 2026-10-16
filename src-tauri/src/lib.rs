@@ -4,6 +4,7 @@ use tauri_plugin_opener::OpenerExt;
 
 pub mod db;
 mod embedder;
+mod face;
 mod indexer;
 mod ocr;
 mod region;
@@ -117,13 +118,15 @@ pub fn run() {
             db::search_similar,
             indexer::index_pause,
             indexer::index_status,
+            indexer::set_face_indexing,
             db::search_text,
             db::screenshot_detail,
             db::screenshot_count,
             watch::set_scan_folders,
             voice::voice_start,
             voice::voice_stop,
-            voice::voice_cancel
+            voice::voice_cancel,
+            face::face_status
         ])
         .on_page_load(|webview, payload| {
             if webview.label() == "main" && matches!(payload.event(), PageLoadEvent::Finished) {

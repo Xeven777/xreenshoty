@@ -9,6 +9,7 @@ import {
   Keyboard,
   Minus,
   Plus,
+  Smiley,
   Trash,
   Warning,
   X,
@@ -20,10 +21,13 @@ import { Input } from "@/components/ui/input"
 import { MAX_DELAY, type Settings } from "@/lib/settings"
 import {
   clearThumbnailCache,
+  faceStatus,
   getDefaultSaveDir,
   openFolderSafe,
+  setFaceIndexing,
   setScanFolders,
   thumbnailCacheSize,
+  type FaceStatus,
 } from "@/lib/screenshot"
 import { eventToAccelerator, prettyAccelerator } from "@/lib/shortcuts"
 import { clearMemoryCaches } from "@/lib/use-thumbnails"
@@ -45,6 +49,7 @@ export function SettingsPanel({
   const [cacheBytes, setCacheBytes] = useState<number | null>(null)
   const [clearing, setClearing] = useState(false)
   const [newFolder, setNewFolder] = useState("")
+  const [face, setFace] = useState<FaceStatus | null>(null)
 
   // The cache size is only read when the tab is mounted, so the number stays
   // honest for as long as Settings is open.
@@ -116,6 +121,18 @@ export function SettingsPanel({
   function removeScanFolder(dir: string) {
     void applyScanFolders(scanFolders.filter((d) => d !== dir))
   }
+
+  // Push the face opt-in to Rust on load and on every change: Rust holds no
+  // settings state, so without this the toggle would be UI-only. The same
+  // first-call-landing rule as `set_scan_folders` applies.
+  useEffect(() => {
+    if (!tauri) return
+    void setFaceIndexing(settings.faceIndexing).catch(() => undefined)
+    // Refresh the readiness readout whenever the toggle flips.
+    void faceStatus()
+      .then((s) => setFace(s))
+      .catch(() => undefined)
+  }, [tauri, settings.faceIndexing])
 
   // The banner lives in this tab only; a toast reaches the user wherever they
   // are when the bind fails (usually triggered from Capture).
@@ -314,6 +331,47 @@ export function SettingsPanel({
             {settings.notifyOnSave ? "On" : "Off"}
           </Button>
         </div>
+        {!tauri ? (
+          <Badge variant="secondary">Needs the desktop shell</Badge>
+        ) : null}
+      </section>
+
+      <section className="space-y-4 rounded-2xl border bg-card p-5 shadow-sm">
+        <header className="flex items-center gap-2.5">
+          <Smiley size={18} className="text-muted-foreground" />
+          <div>
+            <h2 className="font-medium">Face indexing</h2>
+            <p className="text-xs text-muted-foreground">
+              Group screenshots by who appears in them. Off by default.
+            </p>
+          </div>
+        </header>
+        <div className="flex items-center justify-between gap-4">
+          <span className="text-sm">
+            {settings.faceIndexing ? "Enabled" : "Disabled"}
+          </span>
+          <Button
+            size="sm"
+            variant={settings.faceIndexing ? "default" : "secondary"}
+            disabled={!tauri}
+            onClick={() => update("faceIndexing", !settings.faceIndexing)}
+          >
+            {settings.faceIndexing ? (
+              <Check data-icon="inline-start" />
+            ) : (
+              <X data-icon="inline-start" />
+            )}
+            {settings.faceIndexing ? "On" : "Off"}
+          </Button>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Faces are detected on this machine and never leave it, but the index
+          then holds biometric templates — turn this on only if you want that.
+          Needs the face models under ~/apps/models plus the face-env venv.
+          {face
+            ? ` ${face.face_count} face(s) indexed · venv ${face.venv_ready ? "ready" : "missing"} · models ${face.models_present ? "present" : "missing"}.`
+            : ""}
+        </p>
         {!tauri ? (
           <Badge variant="secondary">Needs the desktop shell</Badge>
         ) : null}

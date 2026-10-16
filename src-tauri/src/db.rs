@@ -148,6 +148,40 @@ fn add_column(conn: &Connection, column: &str, decl: &str) -> Result<(), String>
     .map_err(|e| format!("Add column {column} failed: {e}"))
 }
 
+/// Face tables: one row per detected face, plus `vec0` over the SFace vectors.
+///
+/// A face belongs to exactly one screenshot (`screenshot_id`), so deleting the
+/// screenshot deletes its faces. The embedding space is SFace's, not
+/// EmbeddingGemma's — separate table, separate dimension, separate label, same
+/// `distance_metric=cosine` rule as `screenshot_vec`.
+///
+/// Best-effort like the rest of the search schema: a broken extension degrades
+/// the face feature, it never blocks capture.
+fn ensure_face_schema(conn: &Connection) {
+    if let Err(e) = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS faces (
+             id            INTEGER PRIMARY KEY,
+             screenshot_id INTEGER NOT NULL REFERENCES screenshots(id) ON DELETE CASCADE,
+             box_x         REAL    NOT NULL,
+             box_y         REAL    NOT NULL,
+             box_w         REAL    NOT NULL,
+             box_h         REAL    NOT NULL,
+             score         REAL    NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_faces_screenshot ON faces (screenshot_id);",
+    ) {
+        log::warn!("face table unavailable, face indexing disabled: {e}");
+        return;
+    }
+
+    if let Err(e) = conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS face_vec USING vec0(embedding float[{}] distance_metric=cosine);",
+        crate::face::FACE_DIM
+    )) {
+        log::warn!("face vec0 unavailable, face indexing disabled: {e}");
+    }
+}
+
 /// Search tables: FTS5 over OCR text, and `vec0` over embeddings.
 ///
 /// Deliberately best-effort. This is an index over files that already exist on
@@ -236,10 +270,19 @@ fn open(path: &Path) -> Result<Connection, String> {
         // is handed back on every idle poll forever (BM4).
         ("embed_attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("embed_retry_at", "INTEGER"),
+        // Face pass bookkeeping. Unlike OCR/embeddings there is no failure
+        // backoff: a batch-level failure (missing venv, missing models) is an
+        // environment problem, not a row problem, so rows are stamped attempted
+        // and only re-offered when the model label changes. Per-row failures
+        // (undecodable file) are logged and stamped the same way.
+        ("face_indexed_at", "INTEGER"),
+        ("face_model", "TEXT"),
+        ("face_count", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         add_column(&conn, column, decl)?;
     }
 
+    ensure_face_schema(&conn);
     ensure_search_schema(&conn);
     Ok(conn)
 }
@@ -385,6 +428,26 @@ pub fn prune_missing() -> Result<usize, String> {
         for id in &gone {
             tx.execute("DELETE FROM screenshot_vec WHERE rowid = ?1", params![id])
                 .map_err(|e| format!("Vector delete failed: {e}"))?;
+            // Faces cascade two ways: explicit vec delete (vec0 has no
+            // triggers), then the rows. `ON DELETE CASCADE` is declared but
+            // not relied on — SQLite needs `PRAGMA foreign_keys` for that.
+            let fids: Vec<i64> = {
+                let mut stmt = tx
+                    .prepare("SELECT id FROM faces WHERE screenshot_id = ?1")
+                    .map_err(|e| format!("Face read failed: {e}"))?;
+                let ids = stmt
+                    .query_map(params![id], |r| r.get(0))
+                    .map_err(|e| format!("Face read failed: {e}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Face read failed: {e}"))?;
+                ids
+            };
+            for fid in &fids {
+                tx.execute("DELETE FROM face_vec WHERE rowid = ?1", params![fid])
+                    .map_err(|e| format!("Face vector delete failed: {e}"))?;
+            }
+            tx.execute("DELETE FROM faces WHERE screenshot_id = ?1", params![id])
+                .map_err(|e| format!("Face delete failed: {e}"))?;
             tx.execute("DELETE FROM screenshots WHERE id = ?1", params![id])
                 .map_err(|e| format!("Row delete failed: {e}"))?;
         }
@@ -639,6 +702,7 @@ pub struct Pending {
     pub path: String,
     pub needs_ocr: bool,
     pub needs_embedding: bool,
+    pub needs_faces: bool,
 }
 
 /// Rows that are not fully indexed yet. `limit` keeps each pass bounded.
@@ -656,40 +720,62 @@ pub struct Pending {
 /// of silently mixing two incompatible vector spaces (BM7). Rows already marked
 /// `skipped` stay pending by design. Rows inside their failure backoff window
 /// are withheld until `embed_retry_at` passes (BM4).
-pub fn pending(limit: u32, model: &str) -> Result<Vec<Pending>, String> {
+pub fn pending(limit: u32, model: &str, face_model: Option<&str>) -> Result<Vec<Pending>, String> {
+    // Opt-in: `None` offers no face work at all. `Some(label)` offers each row
+    // once; afterwards only a model change re-offers it. The query text is
+    // built statically per case so the bound parameter count always matches
+    // the placeholders actually present (binding an unused ?4 errors).
+    let face_clause: &str = match face_model {
+        None => "(0)",
+        Some(_) => {
+            "(face_indexed_at IS NULL OR (face_model IS NOT ?4 AND face_model IS NOT NULL))"
+        }
+    };
+    let sql = format!(
+        "SELECT id, path,
+                (ocr_boxes IS NULL) AS needs_ocr,
+                (
+                    (embedded_at IS NULL
+                     OR (embed_model IS NOT ?2 AND embed_model IS NOT 'skipped'))
+                    AND (embed_retry_at IS NULL OR embed_retry_at <= ?3)
+                ) AS needs_embedding,
+                {face_clause} AS needs_faces
+         FROM screenshots
+         WHERE needs_ocr OR needs_embedding OR needs_faces
+         ORDER BY needs_ocr DESC, created_at ASC
+         LIMIT ?1",
+    );
     with_conn(|conn| {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, path,
-                        (ocr_boxes IS NULL) AS needs_ocr,
-                        (
-                            (embedded_at IS NULL
-                             OR (embed_model IS NOT ?2 AND embed_model IS NOT 'skipped'))
-                            AND (embed_retry_at IS NULL OR embed_retry_at <= ?3)
-                        ) AS needs_embedding
-                 FROM screenshots
-                 WHERE needs_ocr OR needs_embedding
-                 ORDER BY needs_ocr DESC, created_at ASC
-                 LIMIT ?1",
-            )
-            .map_err(|e| format!("Prepare failed: {e}"))?;
+        let mut stmt = conn.prepare(&sql).map_err(|e| format!("Prepare failed: {e}"))?;
 
-        let rows = stmt
-            .query_map(
-                params![limit.clamp(1, 200) as i64, model, now_millis()],
-                |row| {
-                    Ok(Pending {
-                        id: row.get(0)?,
-                        path: row.get(1)?,
-                        needs_ocr: row.get::<_, i64>(2)? != 0,
-                        needs_embedding: row.get::<_, i64>(3)? != 0,
-                    })
-                },
-            )
-            .map_err(|e| format!("Query failed: {e}"))?;
-
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Row read failed: {e}"))
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<Pending> {
+            Ok(Pending {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                needs_ocr: row.get::<_, i64>(2)? != 0,
+                needs_embedding: row.get::<_, i64>(3)? != 0,
+                needs_faces: row.get::<_, i64>(4)? != 0,
+            })
+        };
+        let rows = match face_model {
+            None => stmt
+                .query_map(
+                    params![limit.clamp(1, 200) as i64, model, now_millis()],
+                    map_row,
+                )
+                .map_err(|e| format!("Query failed: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Row read failed: {e}"))?,
+            Some(label) => stmt
+                .query_map(
+                    params![limit.clamp(1, 200) as i64, model, now_millis(), label],
+                    map_row,
+                )
+                .map_err(|e| format!("Query failed: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Row read failed: {e}"))?,
+        };
+        Ok(rows)
     })
 }
 
@@ -705,6 +791,68 @@ pub fn set_ocr(id: i64, text: &str, words_json: &str) -> Result<(), String> {
         )
         .map_err(|e| format!("Set OCR failed: {e}"))?;
         Ok(())
+    })
+}
+
+/// Stores one screenshot's faces: rows in `faces`, vectors in `face_vec`,
+/// provenance stamp on the screenshot. Replaces any previous faces for the
+/// row (model change, re-run) — DELETE + INSERT, because `vec0` has no UPSERT.
+///
+/// A face count of zero is a finished pass, not a pending one: the stamp
+/// records "attempted" exactly like `ocr_boxes` does, so text-free and
+/// face-free screenshots are not re-offered forever.
+pub fn set_faces(id: i64, hits: &[crate::face::FaceHit], model: &str) -> Result<(), String> {
+    let now = now_millis();
+    with_conn(|conn| {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Transaction failed: {e}"))?;
+        let old: Vec<i64> = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM faces WHERE screenshot_id = ?1")
+                .map_err(|e| format!("Face read failed: {e}"))?;
+            let ids = stmt
+                .query_map(params![id], |r| r.get(0))
+                .map_err(|e| format!("Face read failed: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Face read failed: {e}"))?;
+            ids
+        };
+        for fid in &old {
+            tx.execute("DELETE FROM face_vec WHERE rowid = ?1", params![fid])
+                .map_err(|e| format!("Face vector delete failed: {e}"))?;
+        }
+        tx.execute("DELETE FROM faces WHERE screenshot_id = ?1", params![id])
+            .map_err(|e| format!("Face delete failed: {e}"))?;
+        for h in hits {
+            tx.execute(
+                "INSERT INTO faces (screenshot_id, box_x, box_y, box_w, box_h, score)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, h.box_xywh[0], h.box_xywh[1], h.box_xywh[2], h.box_xywh[3], h.score],
+            )
+            .map_err(|e| format!("Face write failed: {e}"))?;
+            let fid = tx.last_insert_rowid();
+            let bytes = crate::embedder::to_f32_bytes(&h.embedding);
+            tx.execute(
+                "INSERT INTO face_vec(rowid, embedding) VALUES (?1, ?2)",
+                params![fid, bytes],
+            )
+            .map_err(|e| format!("Face vector write failed: {e}"))?;
+        }
+        tx.execute(
+            "UPDATE screenshots SET face_indexed_at = ?1, face_model = ?2, face_count = ?3 WHERE id = ?4",
+            params![now, model, hits.len() as i64, id],
+        )
+        .map_err(|e| format!("Face stamp failed: {e}"))?;
+        tx.commit().map_err(|e| format!("Commit failed: {e}"))
+    })
+}
+
+/// Total indexed faces, for the Settings readiness display.
+pub fn face_count() -> Result<i64, String> {
+    with_conn(|conn| {
+        conn.query_row("SELECT COUNT(*) FROM faces", [], |r| r.get(0))
+            .map_err(|e| format!("Count failed: {e}"))
     })
 }
 
@@ -1690,7 +1838,7 @@ fn prune_removes_gone_rows_and_their_search_entries() {
         .unwrap();
 
         let model = crate::embedder::DEFAULT_MODEL_LABEL;
-        let rows = pending(25, model).unwrap();
+        let rows = pending(25, model, None).unwrap();
         let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(
             paths,
@@ -1703,7 +1851,7 @@ fn prune_removes_gone_rows_and_their_search_entries() {
         // server is actually available.
         mark_embedding_skipped(rows[2].id).unwrap();
         assert!(
-            pending(25, model).unwrap().iter().any(|r| r.path == "/tmp/old.png"),
+            pending(25, model, None).unwrap().iter().any(|r| r.path == "/tmp/old.png"),
             "a skipped row must stay pending or it never gets embedded"
         );
 
@@ -1737,14 +1885,14 @@ fn prune_removes_gone_rows_and_their_search_entries() {
         .unwrap();
 
         assert!(
-            pending(25, crate::embedder::DEFAULT_MODEL_LABEL)
+            pending(25, crate::embedder::DEFAULT_MODEL_LABEL, None)
                 .unwrap()
                 .iter()
                 .any(|r| r.path == "/tmp/old-model.png"),
             "a vector embedded by another model must be re-embedded"
         );
         assert!(
-            !pending(25, "some-other-model")
+            !pending(25, "some-other-model", None)
                 .unwrap()
                 .iter()
                 .any(|r| r.path == "/tmp/old-model.png"),
@@ -1781,7 +1929,7 @@ fn prune_removes_gone_rows_and_their_search_entries() {
         .unwrap();
 
         // Backoff expired (epoch 0): the row is offered.
-        assert!(pending(25, crate::embedder::DEFAULT_MODEL_LABEL)
+        assert!(pending(25, crate::embedder::DEFAULT_MODEL_LABEL, None)
             .unwrap()
             .iter()
             .any(|r| r.id == id));
@@ -1791,7 +1939,7 @@ fn prune_removes_gone_rows_and_their_search_entries() {
         assert_eq!(attempts, 1);
 
         assert!(
-            !pending(25, crate::embedder::DEFAULT_MODEL_LABEL)
+            !pending(25, crate::embedder::DEFAULT_MODEL_LABEL, None)
                 .unwrap()
                 .iter()
                 .any(|r| r.id == id),
@@ -1809,6 +1957,100 @@ fn prune_removes_gone_rows_and_their_search_entries() {
             Ok(())
         })
         .unwrap();
+
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+    }
+
+    /// Faces: `set_faces` writes rows + vectors + stamp in one transaction, a
+    /// second call replaces the first (model change), and `pending` offers the
+    /// row exactly once per model label — never when the toggle is off.
+    #[test]
+    fn faces_are_stored_replaced_and_offered_once_per_model() {
+        let _guard = test_lock();
+        let db = std::env::temp_dir().join("xreenshoty-faces.db");
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+        std::env::set_var("XREENSHOTY_TEST_DB", &db);
+        with_conn(|_| Ok(())).unwrap();
+
+        let id = with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO screenshots
+                     (path, created_at, width, height, source, ocr_boxes, embedded_at, embed_model)
+                 VALUES ('/tmp/face.png', 1, 10, 10, 'capture', '[]', 1, 'embeddinggemma-2-q8_0')",
+                [],
+            )
+            .map_err(|e| format!("insert: {e}"))?;
+            Ok(conn.last_insert_rowid())
+        })
+        .unwrap();
+
+        let hit = || crate::face::FaceHit {
+            box_xywh: [1.0, 2.0, 100.0, 120.0],
+            score: 0.9,
+            embedding: (0..crate::face::FACE_DIM).map(|i| i as f32 / 128.0).collect(),
+        };
+
+        // Off means never offered.
+        let model = crate::embedder::DEFAULT_MODEL_LABEL;
+        assert!(!pending(25, model, None).unwrap().iter().any(|r| r.id == id));
+        // On means offered once.
+        let rows = pending(25, model, Some(crate::face::FACE_MODEL)).unwrap();
+        assert!(rows.iter().any(|r| r.id == id && r.needs_faces));
+
+        // Store two faces, check rows + stamp + KNN ranking.
+        set_faces(id, &[hit(), hit()], crate::face::FACE_MODEL).unwrap();
+        let (nfaces, nvec, stamp, count): (i64, i64, String, i64) = with_conn(|conn| {
+            let nfaces: i64 = conn
+                .query_row("SELECT COUNT(*) FROM faces WHERE screenshot_id = ?1", params![id], |r| r.get(0))
+                .map_err(|e| format!("count faces: {e}"))?;
+            let nvec: i64 = conn
+                .query_row("SELECT COUNT(*) FROM face_vec", [], |r| r.get(0))
+                .map_err(|e| format!("count vec: {e}"))?;
+            let (stamp, count): (String, i64) = conn
+                .query_row(
+                    "SELECT face_model, face_count FROM screenshots WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|e| format!("stamp: {e}"))?;
+            Ok((nfaces, nvec, stamp, count))
+        })
+        .unwrap();
+        assert_eq!((nfaces, nvec, count), (2, 2, 2));
+        assert_eq!(stamp, crate::face::FACE_MODEL);
+
+        // Zero faces is a finished pass, not a pending one.
+        set_faces(id, &[], crate::face::FACE_MODEL).unwrap();
+        let (nfaces2, nvec2): (i64, i64) = with_conn(|conn| {
+            let nfaces2: i64 = conn
+                .query_row("SELECT COUNT(*) FROM faces", [], |r| r.get(0))
+                .map_err(|e| format!("count: {e}"))?;
+            let nvec2: i64 = conn
+                .query_row("SELECT COUNT(*) FROM face_vec", [], |r| r.get(0))
+                .map_err(|e| format!("count: {e}"))?;
+            Ok((nfaces2, nvec2))
+        })
+        .unwrap();
+        assert_eq!((nfaces2, nvec2), (0, 0), "replace must delete stale vectors");
+        assert!(
+            !pending(25, model, Some(crate::face::FACE_MODEL))
+                .unwrap()
+                .iter()
+                .any(|r| r.id == id),
+            "a stamped row must not be re-offered for the same model"
+        );
+        // A model change re-offers it.
+        assert!(
+            pending(25, model, Some("some-other-face-model"))
+                .unwrap()
+                .iter()
+                .any(|r| r.id == id && r.needs_faces),
+            "a model change must re-offer the row"
+        );
 
         for suffix in ["", "-wal", "-shm"] {
             std::fs::remove_file(format!("{}{suffix}", db.display())).ok();

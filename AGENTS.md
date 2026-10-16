@@ -9,10 +9,9 @@ Local-first screenshot capture for Linux desktops. Tauri 2 + React 19 + Tailwind
 Screenshots land in the user's Pictures folder; OCR/semantic search come later
 (see `plan.md` for milestones). Everything must stay offline.
 
-Status: Milestones 1–4 and 5.1/5.2/5.5 implemented. Keyword search (FTS5 over
-OCR text) works against all 370 screenshots, and **image embeddings work** via
-`/v1/embeddings` — see the trap below for the exact shape. No Python is needed
-for the AI stack.
+Status: Milestones 1–4, 5.0-5.6, 6.1-6.3 and 7.0-7.3 (face indexing, opt-in)
+implemented. Remaining: 6.4 answer synthesis, 6.5 rerank if needed, 7.4-7.6
+face clustering / People view / search-by-face.
 
 ## Embedding runtime (verified — do not re-derive)
 
@@ -315,6 +314,25 @@ already `tsc -b` — do not "simplify" it back to `--noEmit`.
   `needle.transcribe` returns a dict with `"text"`), with `HF_HUB_OFFLINE=1`
   so it stays offline against the `~/.cache` weights. Temp WAVs live in
   `temp_dir()` and are deleted after transcribe/cancel.
+- **Faces: YuNet + SFace through the `face-env` venv (`face.rs`, M7).** Detection
+  is `cv2.FaceDetectorYN` on the **2023mar** YuNet (fixed 640x640); recognition is
+  raw `onnxruntime` on SFace (128-d). Both ONNX files live in `~/apps/models`.
+  The 5-point landmarks drive an affine warp to the 112x112 ArcFace template —
+  **never feed bbox crops to the recognizer** (silently bad similarity). Faces
+  under 80 px are held out (`XREENSHOTY_FACE_MIN_PX`): they embed near-identically
+  regardless of identity and become one junk cluster. Opt-in via the Settings
+  toggle (`set_face_indexing`); census on this box is 40/397 images. Traps:
+  - **SFace's ONNX spews ~80 KB of `Initializer ... in graph inputs` stderr per
+    session.** That is larger than a Linux pipe's 64 KB buffer, so a parent that
+    reads pipes only after the child exits deadlocks forever (found the hard way).
+    Two fixes are both load-bearing: the script silences ORT's C++ logger, and
+    `face::extract` drains stdout/stderr on threads *while* polling.
+  - **`ort.set_default_logger_severity` takes 0..4, not a `logging` level.**
+    `logging.ERROR` (40) raises "Invalid logging severity" — swallowed by a bare
+    `except: pass` this looks like a working fix while writing all 80 KB anyway.
+  - **YuNet's 2026may export breaks in raw ORT** (dynamic-shape `Add_44`
+    broadcast failure on non-stride-32 inputs; outputs raw per-stride anchors,
+    not `[N, 15]` rows). 2026may exists for OpenCV 5.x's internal engine only.
 - **Files are the source of truth, not the DB.** Milestone 4 must keep PNGs in
   Pictures; SQLite is metadata only.
 - **Metadata is recorded in `save_png`, not per capture mode.** All three modes

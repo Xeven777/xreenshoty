@@ -194,6 +194,22 @@ export function indexPause(paused: boolean) {
   return trackedInvoke<void>("index_pause", { paused })
 }
 
+/** Push the face-indexing opt-in to Rust. Off by default (Milestone 7). */
+export function setFaceIndexing(enabled: boolean) {
+  return trackedInvoke<void>("set_face_indexing", { enabled })
+}
+
+export interface FaceStatus {
+  venv_ready: boolean
+  models_present: boolean
+  face_count: number
+}
+
+/** face-env + models + indexed face count, for the Settings readout. */
+export function faceStatus() {
+  return trackedInvoke<FaceStatus>("face_status")
+}
+
 export function screenshotCount() {
   return trackedInvoke<number>("screenshot_count")
 }

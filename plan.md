@@ -483,32 +483,39 @@ deletable per cluster.
 Measurements, in order. If 7.0 fails, stop and report rather than building on it.
 
 1. `onnxruntime` install size, venv size, cold boot time, RSS. Target < 200 MB.
-2. Model sizes actually on disk: `face_detection_yunet_2026may.onnx` plus one
-   recognizer. Target < 15 MB combined.
-3. **Census over the ~370 existing screenshots: how many contain at least one
-   face >= 80 px, and what is the face-size distribution?** This is the R1 gate
-   and the go/no-go on the whole milestone.
-4. Latency per image, CPU only, over that census.
-5. Cosine separation: same-person aligned pairs vs different-person pairs, one
-   histogram each. The `eps` actually chosen goes into this document with the
-   numbers behind it — not before.
-6. EdgeFace ONNX export verified against the `.pt` output on the same crop.
+   DONE 7.0a: venv `face-env` (onnxruntime 1.31.0, numpy, pillow,
+   opencv-python-headless) works; same-person cosine 0.9979 on the two
+   `anish*.png` portraits.
+2. Model sizes actually on disk: `face_detection_yunet_2023mar.onnx` (233 KB)
+   plus `face_recognition_sface_2021dec.onnx` (**38.7 MB** — SFace is bigger
+   than the ~2 MB estimate; combined ~39 MB, so the "<15 MB" target is
+   superseded. Disk, not the gate; runtime RSS is).
+   NOTE: the plan said 2026may, but its dynamic-shape export fails in raw
+   onnxruntime (`Add_44` broadcast 36-vs-37 on non-stride-32 inputs) and emits
+   raw anchors, not `[N, 15]` rows. The implementation uses **2023mar**
+   (fixed 640x640) through `cv2.FaceDetectorYN`, which owns the anchor math.
+3. **Census: 40/397 images (10%) have >=1 face >= 80 px; 63 faces total.**
+   The high cross-image cosine (median 0.848) is explained, not alarming: one
+   bearded man repeats across ~15 meeting screenshots, so most pairs are not
+   strangers. R1 gate: thin but real — proceed, sized as an experiment.
+4. Latency: **~0.06 s/image CPU** (23.9 s wall for 397 images), ~0.22 s for a
+   2-image batch including interpreter boot.
+5. Cosine separation: same-image pairs median 0.897 (n=55, all > 0.4);
+   cross-image median 0.848 (n=1898). No clean gap — `eps` for 7.4 still
+   needs labelled pairs, not these auto-stats.
+6. DROPPED: EdgeFace is out. Decision 2026-10-16: ship YuNet + SFace instead
+   (both OpenCV zoo, both Apache-2.0, both download-and-run, no export step).
 
 ### Work slices
 
-- [ ] **7.0 Spike** — the measurements above. Gates everything below it.
-- [ ] **7.1 Schema.** Idempotent, per the existing `add_column` PRAGMA rule. A
-      separate `face_vec` `vec0` table with **`distance_metric=cosine` stated
-      explicitly** (the default is L2, which is not a similarity), plus a cluster
-      table holding face ids and a user-given name. On any model change the face
-      rows must be droppable and rebuildable from the PNGs, never migrated.
-- [ ] **7.2 `face.rs`** — shells out to `face-env` python, mirroring `voice.rs`
-      (venv discovery, JSON over stdout, graceful missing-venv error). Expose
-      `min_face_px` as an env override so the R1 gate can be tuned without a
-      rebuild.
-- [ ] **7.3 Stage wiring in `indexer.rs`** — after the embedding stage, inside
-      the same batch, never blocking capture. Record the model name next to every
-      vector so the number has provenance.
+- [x] **7.0 Spike** — done 2026-10-16, YuNet + SFace (see numbered findings).
+- [x] **7.1 Schema.** `faces` + `face_vec` (128-d, cosine), stamp columns,
+      prune cascade. Done 2026-10-16.
+- [x] **7.2 `face.rs`** — `face-env` subprocess, JSON stdin/stdout, 80 px gate
+      on both sides, `face_status` probe. Done 2026-10-16.
+- [x] **7.3 Stage wiring in `indexer.rs`** — after embeddings, opt-in
+      `FACE_INDEXING` flag, rows stamped attempted on success only. Plus the
+      Settings toggle + readiness readout. Done 2026-10-16.
 - [ ] **7.4 Clustering** — `eps` from the 7.0 numbers, with the 80 px gate.
 - [ ] **7.5 People view** — cluster list with a representative tile per cluster,
       click-through to screenshots, rename and merge controls.

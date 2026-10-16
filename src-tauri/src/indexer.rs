@@ -17,6 +17,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::db;
 use crate::embedder::{Config, Embedder};
+use crate::face;
 use crate::ocr;
 
 /// How often the worker wakes up on its own if nothing pokes it.
@@ -72,6 +73,25 @@ pub fn shutdown() {
     if let Some(embedder) = embedder() {
         embedder.shutdown();
     }
+}
+
+/// Face indexing opt-in. Rust holds no settings state (AGENTS.md): the
+/// frontend owns the toggle in `localStorage` and pushes it here on load and
+/// on every change, exactly like `set_scan_folders`. Off by default.
+static FACE_INDEXING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn face_indexing_enabled() -> bool {
+    FACE_INDEXING.load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+pub async fn set_face_indexing(enabled: bool) -> Result<(), String> {
+    FACE_INDEXING.store(enabled, Ordering::Relaxed);
+    if enabled {
+        poke();
+    }
+    Ok(())
 }
 
 /// Snapshot for the UI. `paused` is read here rather than tracked separately so
@@ -192,7 +212,11 @@ impl Indexer {
             }
 
             let label = self.embedder.model_label();
-            let rows = match db::pending(BATCH, &label) {
+            // Opt-in, off by default: the frontend pushes the Settings toggle
+            // through `set_face_indexing` (same shape as `set_scan_folders`).
+            // `None` means `pending()` offers no face work at all.
+            let face_label = face_indexing_enabled().then_some(face::FACE_MODEL);
+            let rows = match db::pending(BATCH, &label, face_label) {
                 Ok(rows) => rows,
                 Err(e) => {
                     log::warn!("indexer: could not read pending work: {e}");
@@ -318,6 +342,47 @@ impl Indexer {
                             row.path.rsplit('/').next().unwrap_or(&row.path)
                         );
                     }
+                }
+            }
+
+            // --- Faces: one subprocess for the whole batch, after embeddings. ---
+            // Ready means venv + script + models; without it the rows stay
+            // untouched so they are re-offered when the environment is fixed.
+            let to_face: Vec<_> = rows.iter().filter(|r| r.needs_faces).collect();
+            if !to_face.is_empty() && face_label.is_some() {
+                if face::venv_ready() && face::models_present() {
+                    let paths: Vec<String> =
+                        to_face.iter().map(|r| r.path.clone()).collect();
+                    match face::extract(&paths) {
+                        Ok(all) => {
+                            for (row, hits) in to_face.iter().zip(all.iter()) {
+                                match db::set_faces(row.id, hits, face::FACE_MODEL) {
+                                    Ok(()) => {
+                                        touched.insert(row.id);
+                                        if !hits.is_empty() {
+                                            log::info!(
+                                                "indexer: {} face(s) in {}",
+                                                hits.len(),
+                                                row.path.rsplit('/').next().unwrap_or(&row.path)
+                                            );
+                                        }
+                                    }
+                                    Err(e) => log::warn!(
+                                        "indexer: face store failed for {}: {e}",
+                                        row.path
+                                    ),
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // Batch-level failure is environmental, not per-row:
+                            // log once and leave the rows unstamped so a fixed
+                            // env picks them up on a later pass.
+                            log::warn!("indexer: face batch failed: {e}");
+                        }
+                    }
+                } else {
+                    log::debug!("indexer: face env incomplete, deferring face pass");
                 }
             }
 
