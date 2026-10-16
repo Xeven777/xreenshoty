@@ -5,6 +5,11 @@ use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 
+/// Historical label for the default model. Do not change it: it is the value
+/// already stored against every existing `screenshot_vec` row, and a different
+/// string would mark the whole library stale and trigger a full re-embed.
+pub const DEFAULT_MODEL_LABEL: &str = "embeddinggemma-2-q8_0";
+
 /// Where the model files live. Overridable so this is not hardcoded to one
 /// machine: env first, then the layout used during the runtime spike.
 #[derive(Debug, Clone)]
@@ -42,7 +47,10 @@ impl Config {
             device: std::env::var("XREENSHOTY_EMBED_DEVICE")
                 .unwrap_or_else(|_| resolve_device()),
             host: "127.0.0.1".into(),
-            port: 8080,
+            port: std::env::var("XREENSHOTY_EMBED_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8080),
             image_max_tokens: std::env::var("XREENSHOTY_IMAGE_MAX_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -55,9 +63,32 @@ impl Config {
     }
 
     /// Model name recorded against each vector, so a later model change can be
-    /// detected instead of silently mixing incompatible embeddings.
-    pub fn model_label() -> &'static str {
-        "embeddinggemma-2-q8_0"
+    /// detected instead of silently mixing incompatible embeddings (BM7).
+    ///
+    /// The default model keeps a fixed historical label. Deriving the label from
+    /// the filename would change it for existing installs (and re-embed the whole
+    /// library) with no actual model change. Any *other* model is labelled by its
+    /// own file names, so pointing `XREENSHOTY_EMBED_MODEL` at a different
+    /// checkpoint marks every old vector stale and forces a clean re-embed.
+    fn label(&self) -> String {
+        let stem = self
+            .model
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        if stem == "embeddinggemma-2-Q8_0" {
+            return DEFAULT_MODEL_LABEL.to_string();
+        }
+        let mmproj = self
+            .mmproj
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if mmproj.is_empty() {
+            stem.to_string()
+        } else {
+            format!("{stem}+{mmproj}")
+        }
     }
 
     fn files_present(&self) -> Result<(), String> {
@@ -158,7 +189,7 @@ impl Embedder {
     /// Loading the model takes a couple of minutes, so this returns immediately;
     /// callers should gate on `is_ready()` rather than assume availability.
     pub fn start(&self) -> Result<(), String> {
-        if self.is_ready() {
+        if self.is_llama_server() {
             // Reusing somebody else's server means we did not spawn it, so we
             // cannot pin its GPU. Worth saying out loud: an unpinned server
             // lands on the iGPU or llvmpipe and is ~14x slower.
@@ -170,6 +201,18 @@ impl Embedder {
                 self.config.device
             );
             return Ok(());
+        }
+        // Something answers on the port but is not a llama.cpp server. Spawning
+        // would fail to bind, and reusing it would make every embed request fail
+        // with a confusing parse error, so say exactly what is wrong instead
+        // (BM8). A plain `/health` 200 is not proof: any HTTP service can serve
+        // `/health`.
+        if self.health.get(&self.config.url("/health")).call().is_ok() {
+            return Err(format!(
+                "port {} is serving something that is not llama-server; set \
+                 XREENSHOTY_EMBED_PORT to a free port",
+                self.config.port
+            ));
         }
         self.config.files_present()?;
         log::info!(
@@ -234,6 +277,28 @@ impl Embedder {
             .get(&self.config.url("/health"))
             .call()
             .is_ok()
+    }
+
+    /// Label of the model currently configured, recorded against every vector it
+    /// produces so a later model change is detected (BM7).
+    pub fn model_label(&self) -> String {
+        self.config.label()
+    }
+
+    /// True only when the port is answered by a llama.cpp server, identified by
+    /// its `/v1/models` list (a non-empty `data` array). `/health` alone is not
+    /// identity: an unrelated service on the port can answer it too (BM8).
+    pub fn is_llama_server(&self) -> bool {
+        let Ok(response) = self.health.get(&self.config.url("/v1/models")).call() else {
+            return false;
+        };
+        let Ok(raw) = response.into_body().read_to_string() else {
+            return false;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return false;
+        };
+        json["data"].as_array().is_some_and(|models| !models.is_empty())
     }
 
     /// Block until the server answers `/health`, or give up.

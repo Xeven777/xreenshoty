@@ -77,6 +77,7 @@ export function IndexIndicator() {
           exit={{ opacity: 0, x: 10 }}
           transition={{ duration: 0.3 }}
           title={paused ? "Resume indexing" : "Pause indexing"}
+          aria-label={paused ? "Resume indexing" : "Pause indexing"}
           onClick={() => {
             void indexPause(!paused).then(() => {
               toast(paused ? "Indexing resumed" : "Indexing paused")
@@ -84,8 +85,6 @@ export function IndexIndicator() {
             })
           }}
           className="absolute flex items-center gap-2 rounded-full border bg-card px-3 py-1.5 text-xs transition-colors hover:bg-muted"
-          role="status"
-          aria-live="polite"
         >
           <Circle
             size={12}
@@ -96,7 +95,10 @@ export function IndexIndicator() {
                 : "shrink-0 animate-pulse text-primary"
             }
           />
-          <span className="text-muted-foreground">
+          {/* The live region lives on the status text, not the button: a
+              `role="status"` on the button replaces its native button role, so
+              the pause action stops being announced as actionable (M9). */}
+          <span className="text-muted-foreground" role="status" aria-live="polite">
             {state.kind === "loading" && "Loading model…"}
             {state.kind === "ocr" && "Scanning Image…"}
             {state.kind === "working" &&

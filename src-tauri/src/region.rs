@@ -4,7 +4,9 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use screenshots::image::RgbaImage;
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder, Window};
 
-use crate::screenshot::{ensure_dir, resolve_dir, save_png, screens_for_pointer};
+use crate::screenshot::{
+    ensure_dir, offload, resolve_dir, save_png, screens_for_pointer,
+};
 
 pub const OVERLAY_LABEL: &str = "region-overlay";
 
@@ -27,12 +29,18 @@ fn png_data_url(image: &RgbaImage) -> Result<String, String> {
 /// PNG data URL of the frozen backdrop, fetched by the overlay on mount rather
 /// than pushed via an event, which a late listener would miss.
 #[tauri::command]
-pub fn backdrop_data_url(state: State<'_, Backdrop>) -> Result<String, String> {
-    let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
-    guard
-        .as_ref()
-        .ok_or_else(|| "No backdrop captured".to_string())
-        .and_then(png_data_url)
+pub async fn backdrop_data_url(state: State<'_, Backdrop>) -> Result<String, String> {
+    // Clone under the lock, then encode on the blocking pool: the PNG encode of
+    // a full-monitor frame (8 MB at 1080p, 33 MB at 4K) must not run on the main
+    // thread while holding the backdrop mutex (BM1).
+    let image = {
+        let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .ok_or_else(|| "No backdrop captured".to_string())?
+            .clone()
+    };
+    offload(move || png_data_url(&image)).await
 }
 
 /// Bounds plus a full grab of the monitor under the cursor. Returns both from a
@@ -76,7 +84,9 @@ pub async fn begin_region_select(
     let _ = window.hide();
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-    let ((x, y, w, h), image) = match capture_monitor_under_pointer() {
+    // The grab is a full-monitor capture; run it on the blocking pool so the
+    // window hide/show and the async runtime are never blocked by it (BM1).
+    let ((x, y, w, h), image) = match offload(capture_monitor_under_pointer).await {
         Ok(v) => v,
         Err(e) => {
             let _ = window.show();
@@ -118,7 +128,7 @@ pub async fn begin_region_select(
 /// Crops the selected rectangle out of the frozen backdrop and saves it. No
 /// second screen grab happens, so the result is exactly what the user selected.
 #[tauri::command]
-pub fn save_region_from_backdrop(
+pub async fn save_region_from_backdrop(
     state: State<'_, Backdrop>,
     x: i32,
     y: i32,
@@ -132,29 +142,28 @@ pub fn save_region_from_backdrop(
     let dir = resolve_dir(save_dir)?;
     ensure_dir(&dir)?;
 
-    let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
-    let backdrop = guard
-        .as_ref()
-        .ok_or_else(|| "Backdrop is gone; region selection expired".to_string())?;
+    // Crop while holding the lock, then release before encoding: the crop is a
+    // bounded copy, the PNG encode (inside `save_png`) is the expensive half and
+    // belongs on the blocking pool.
+    let cropped = {
+        let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+        let backdrop = guard
+            .as_ref()
+            .ok_or_else(|| "Backdrop is gone; region selection expired".to_string())?;
 
-    let max_x = backdrop.width().saturating_sub(1);
-    let max_y = backdrop.height().saturating_sub(1);
-    if x < 0 || y < 0 || x as u32 > max_x || y as u32 > max_y {
-        return Err(format!("Selection ({x}, {y}) is outside the captured area"));
-    }
-    let w = width.min(backdrop.width() - x as u32);
-    let h = height.min(backdrop.height() - y as u32);
+        let max_x = backdrop.width().saturating_sub(1);
+        let max_y = backdrop.height().saturating_sub(1);
+        if x < 0 || y < 0 || x as u32 > max_x || y as u32 > max_y {
+            return Err(format!("Selection ({x}, {y}) is outside the captured area"));
+        }
+        let w = width.min(backdrop.width() - x as u32);
+        let h = height.min(backdrop.height() - y as u32);
 
-    let cropped = screenshots::image::imageops::crop_imm(
-        backdrop,
-        x as u32,
-        y as u32,
-        w,
-        h,
-    )
-    .to_image();
+        screenshots::image::imageops::crop_imm(backdrop, x as u32, y as u32, w, h).to_image()
+    };
 
-    save_png(cropped, &dir, &format!("region-{x}x{y}-{w}x{h}"))
+    let stem = format!("region-{x}x{y}-{}x{}", cropped.width(), cropped.height());
+    offload(move || save_png(cropped, &dir, &stem)).await
 }
 
 #[tauri::command]

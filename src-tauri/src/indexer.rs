@@ -87,6 +87,12 @@ pub struct IndexStatus {
 
 #[tauri::command]
 pub async fn index_status() -> Result<IndexStatus, String> {
+    // `is_ready` is a synchronous HTTP call (800 ms timeout) and the DB read is
+    // blocking; neither belongs on an async worker (BM2).
+    crate::screenshot::offload(index_status_blocking).await
+}
+
+fn index_status_blocking() -> Result<IndexStatus, String> {
     let p = db::index_progress()?;
     let idx = indexer();
     Ok(IndexStatus {
@@ -185,7 +191,8 @@ impl Indexer {
                 continue;
             }
 
-            let rows = match db::pending(BATCH) {
+            let label = self.embedder.model_label();
+            let rows = match db::pending(BATCH, &label) {
                 Ok(rows) => rows,
                 Err(e) => {
                     log::warn!("indexer: could not read pending work: {e}");
@@ -278,17 +285,27 @@ impl Indexer {
                 // measured 0.96x -- no better than sequential, because the GPU
                 // is already saturated and a batch just delays the response
                 // until all of them are done.
-                let label = Config::model_label();
                 let threshold = slow_image_threshold();
                 for row in &to_embed {
                     let started = std::time::Instant::now();
-                    match self.embed_one(row, label) {
+                    match self.embed_one(row, &label) {
                         Ok(()) => {
                             touched.insert(row.id);
                         }
                         Err(e) => {
                             log::warn!("indexer: embedding {} failed: {e}", row.path);
-                            let _ = db::mark_embedding_skipped(row.id);
+                            // Permanent failures must not be re-queued at full
+                            // speed: back off so one broken image cannot starve
+                            // the rest of the library (BM4).
+                            match db::record_embed_failure(row.id) {
+                                Ok(n) => log::warn!(
+                                    "indexer: backing off {} after {n} attempt(s)",
+                                    row.path.rsplit('/').next().unwrap_or(&row.path)
+                                ),
+                                Err(e) => {
+                                    log::warn!("indexer: recording failure failed: {e}")
+                                }
+                            }
                             continue;
                         }
                     }

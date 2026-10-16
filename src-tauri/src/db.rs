@@ -231,6 +231,11 @@ fn open(path: &Path) -> Result<Connection, String> {
         ("ocr_boxes", "TEXT"),
         ("embedded_at", "INTEGER"),
         ("embed_model", "TEXT"),
+        // Backoff bookkeeping for rows the embedding server keeps failing on
+        // (a corrupt PNG, a transient 500). Without these the same hopeless row
+        // is handed back on every idle poll forever (BM4).
+        ("embed_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("embed_retry_at", "INTEGER"),
     ] {
         add_column(&conn, column, decl)?;
     }
@@ -411,6 +416,12 @@ fn is_indexable_image(path: &Path) -> bool {
 
 #[tauri::command]
 pub async fn import_existing(dir: Option<String>) -> Result<usize, String> {
+    // Directory scan plus a header decode per new file; blocking work belongs on
+    // the blocking pool, not an async worker (BM2).
+    crate::screenshot::offload(move || import_existing_blocking(dir)).await
+}
+
+fn import_existing_blocking(dir: Option<String>) -> Result<usize, String> {
     // Reconcile before adding: a PNG deleted outside the app otherwise keeps a
     // ghost row forever. Best-effort — a prune failure must not stop the import.
     let _ = prune_missing();
@@ -639,13 +650,23 @@ pub struct Pending {
 /// because they needed embedding, so the queue head never advanced past them and
 /// every later screenshot was never OCR'd at all. Within each group the
 /// original backfill order is preserved.
-pub fn pending(limit: u32) -> Result<Vec<Pending>, String> {
+///
+/// `model` is the label of the embeddings currently configured. A row whose
+/// stored `embed_model` differs is returned again so it is re-embedded instead
+/// of silently mixing two incompatible vector spaces (BM7). Rows already marked
+/// `skipped` stay pending by design. Rows inside their failure backoff window
+/// are withheld until `embed_retry_at` passes (BM4).
+pub fn pending(limit: u32, model: &str) -> Result<Vec<Pending>, String> {
     with_conn(|conn| {
         let mut stmt = conn
             .prepare(
                 "SELECT id, path,
                         (ocr_boxes IS NULL) AS needs_ocr,
-                        (embedded_at IS NULL) AS needs_embedding
+                        (
+                            (embedded_at IS NULL
+                             OR (embed_model IS NOT ?2 AND embed_model IS NOT 'skipped'))
+                            AND (embed_retry_at IS NULL OR embed_retry_at <= ?3)
+                        ) AS needs_embedding
                  FROM screenshots
                  WHERE needs_ocr OR needs_embedding
                  ORDER BY needs_ocr DESC, created_at ASC
@@ -654,14 +675,17 @@ pub fn pending(limit: u32) -> Result<Vec<Pending>, String> {
             .map_err(|e| format!("Prepare failed: {e}"))?;
 
         let rows = stmt
-            .query_map(params![limit.clamp(1, 200) as i64], |row| {
-                Ok(Pending {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    needs_ocr: row.get::<_, i64>(2)? != 0,
-                    needs_embedding: row.get::<_, i64>(3)? != 0,
-                })
-            })
+            .query_map(
+                params![limit.clamp(1, 200) as i64, model, now_millis()],
+                |row| {
+                    Ok(Pending {
+                        id: row.get(0)?,
+                        path: row.get(1)?,
+                        needs_ocr: row.get::<_, i64>(2)? != 0,
+                        needs_embedding: row.get::<_, i64>(3)? != 0,
+                    })
+                },
+            )
             .map_err(|e| format!("Query failed: {e}"))?;
 
         rows.collect::<Result<Vec<_>, _>>()
@@ -703,11 +727,40 @@ pub fn set_embedding(id: i64, bytes: &[u8], model: &str) -> Result<(), String> {
         )
         .map_err(|e| format!("Vector write failed: {e}"))?;
         tx.execute(
-            "UPDATE screenshots SET embedded_at = ?1, embed_model = ?2 WHERE id = ?3",
+            "UPDATE screenshots
+             SET embedded_at = ?1, embed_model = ?2, embed_attempts = 0, embed_retry_at = NULL
+             WHERE id = ?3",
             params![now, model, id],
         )
         .map_err(|e| format!("Embedding stamp failed: {e}"))?;
         tx.commit().map_err(|e| format!("Commit failed: {e}"))
+    })
+}
+
+/// Records a failed embedding attempt and schedules the next retry (BM4).
+///
+/// The delay grows exponentially (1s, 2s, 4s ... capped at ~4 min) so a
+/// permanently broken row stops crowding out healthy ones, while a transient
+/// server hiccup is still retried quickly. `embed_attempts` is reset by
+/// `set_embedding`, so the backoff only ever applies to a row that keeps
+/// failing. Returns the new attempt count.
+pub fn record_embed_failure(id: i64) -> Result<u32, String> {
+    with_conn(|conn| {
+        conn.execute(
+            "UPDATE screenshots
+             SET embed_attempts = embed_attempts + 1,
+                 embed_retry_at = ?1 + (1000 << MIN(embed_attempts, 8))
+             WHERE id = ?2",
+            params![now_millis(), id],
+        )
+        .map_err(|e| format!("Failure stamp failed: {e}"))?;
+        conn.query_row(
+            "SELECT embed_attempts FROM screenshots WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n.max(0) as u32)
+        .map_err(|e| format!("Attempt read failed: {e}"))
     })
 }
 
@@ -895,47 +948,56 @@ pub async fn search_text(query: String, limit: Option<u32>) -> Result<Vec<Search
 /// arbitrary rows with distance 0.
 #[tauri::command]
 pub async fn search_similar(query: String, limit: Option<u32>) -> Result<Vec<SearchHit>, String> {
-    let embedder = crate::indexer::embedder().ok_or("embedding server not running")?;
-    let vector = embedder.embed_query(&query)?;
-    if vector.len() != EMBED_DIM {
-        return Err(format!("expected {EMBED_DIM} dims, got {}", vector.len()));
-    }
-    let limit = limit.unwrap_or(50).clamp(1, 200);
-    let bytes = crate::embedder::to_f32_bytes(&vector);
-
-    with_conn(|conn| {
-        let mut stmt = conn
-            .prepare(
-                "SELECT s.path, s.created_at, s.width, s.height, s.source, v.distance
-                 FROM screenshot_vec v
-                 JOIN screenshots s ON s.id = v.rowid
-                 WHERE v.embedding MATCH ?1 AND v.k = ?2
-                 ORDER BY v.distance",
-            )
-            .map_err(|e| format!("Prepare failed: {e}"))?;
-        let mut hits = stmt
-            .query_map(params![bytes, limit as i64], |row| {
-                Ok(SearchHit::visual(
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            })
-            .map_err(|e| format!("Query failed: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Row read failed: {e}"))?;
-        let cosines: Vec<f64> = hits
-            .iter()
-            .map(|h: &SearchHit| h.score.unwrap_or(0.0) as f64)
-            .collect();
-        for (hit, z) in hits.iter_mut().zip(standardise(&cosines)) {
-            hit.score_z = Some(z as f32);
+    // `embed_query` is a synchronous HTTP round-trip; run the whole command on
+    // the blocking pool so it never stalls the async runtime (BM2).
+    crate::screenshot::offload(move || {
+        let embedder = crate::indexer::embedder().ok_or("embedding server not running")?;
+        let vector = embedder.embed_query(&query)?;
+        if vector.len() != EMBED_DIM {
+            return Err(format!("expected {EMBED_DIM} dims, got {}", vector.len()));
         }
-        Ok(hits)
+        let limit = limit.unwrap_or(50).clamp(1, 200);
+        // Only vectors from the configured model are comparable. A row embedded
+        // by a different model lives in a different space and would produce
+        // nonsense neighbours (BM7).
+        let model = embedder.model_label();
+        let bytes = crate::embedder::to_f32_bytes(&vector);
+
+        with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT s.path, s.created_at, s.width, s.height, s.source, v.distance
+                     FROM screenshot_vec v
+                     JOIN screenshots s ON s.id = v.rowid
+                     WHERE v.embedding MATCH ?1 AND v.k = ?2 AND s.embed_model = ?3
+                     ORDER BY v.distance",
+                )
+                .map_err(|e| format!("Prepare failed: {e}"))?;
+            let mut hits = stmt
+                .query_map(params![bytes, limit as i64, model], |row| {
+                    Ok(SearchHit::visual(
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })
+                .map_err(|e| format!("Query failed: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Row read failed: {e}"))?;
+            let cosines: Vec<f64> = hits
+                .iter()
+                .map(|h: &SearchHit| h.score.unwrap_or(0.0) as f64)
+                .collect();
+            for (hit, z) in hits.iter_mut().zip(standardise(&cosines)) {
+                hit.score_z = Some(z as f32);
+            }
+            Ok(hits)
+        })
     })
+    .await
 }
 
 /// Convert vec0's L2 distance into a cosine similarity.
@@ -1086,6 +1148,12 @@ fn fusion_weights() -> (f64, f64) {
 /// degrades to plain keyword search instead of failing the whole query.
 #[tauri::command]
 pub async fn search_hybrid(query: String, limit: Option<u32>) -> Result<Vec<SearchHit>, String> {
+    // The embedder round-trip and the SQLite scans are both blocking; keep them
+    // off the async runtime (BM2).
+    crate::screenshot::offload(move || search_hybrid_blocking(query, limit)).await
+}
+
+fn search_hybrid_blocking(query: String, limit: Option<u32>) -> Result<Vec<SearchHit>, String> {
     let limit = limit.unwrap_or(50).clamp(1, 200);
     // Over-fetch each arm so a result ranked just outside the final cut-off by
     // one retriever can still be pulled in by agreement with the other.
@@ -1093,18 +1161,23 @@ pub async fn search_hybrid(query: String, limit: Option<u32>) -> Result<Vec<Sear
 
     // Visual arm first: embedding is the slow step and decides whether we can
     // run two arms at all.
-    let vector = match crate::indexer::embedder() {
-        Some(e) => match e.embed_query(&query) {
-            Ok(v) if v.len() == EMBED_DIM => Some(crate::embedder::to_f32_bytes(&v)),
-            Ok(v) => {
-                return Err(format!("expected {EMBED_DIM} dims, got {}", v.len()));
+    let (vector, model) = match crate::indexer::embedder() {
+        Some(e) => {
+            let model = e.model_label();
+            match e.embed_query(&query) {
+                Ok(v) if v.len() == EMBED_DIM => {
+                    (Some(crate::embedder::to_f32_bytes(&v)), model)
+                }
+                Ok(v) => {
+                    return Err(format!("expected {EMBED_DIM} dims, got {}", v.len()));
+                }
+                Err(e) => {
+                    log::warn!("search: visual arm unavailable, keyword only ({e})");
+                    (None, model)
+                }
             }
-            Err(e) => {
-                log::warn!("search: visual arm unavailable, keyword only ({e})");
-                None
-            }
-        },
-        None => None,
+        }
+        None => (None, String::new()),
     };
 
     let snippet_sql = "snippet(screenshots_fts, 0, '\u{1f}', '\u{1e}', '…', 24)";
@@ -1124,9 +1197,18 @@ pub async fn search_hybrid(query: String, limit: Option<u32>) -> Result<Vec<Sear
         let visual = match &vector {
             Some(bytes) => ranked_scored(
                 conn,
-                "SELECT rowid, distance FROM screenshot_vec
-                 WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance",
-                &[bytes as &dyn rusqlite::ToSql, &(pool as i64) as &dyn rusqlite::ToSql],
+                // Only vectors from the configured model belong in the same
+                // space; a stale vector from a previous model would rank
+                // arbitrarily (BM7).
+                "SELECT v.rowid, v.distance FROM screenshot_vec v
+                 JOIN screenshots s ON s.id = v.rowid
+                 WHERE v.embedding MATCH ?1 AND v.k = ?2 AND s.embed_model = ?3
+                 ORDER BY v.distance",
+                &[
+                    bytes as &dyn rusqlite::ToSql,
+                    &(pool as i64) as &dyn rusqlite::ToSql,
+                    &model as &dyn rusqlite::ToSql,
+                ],
             )
             // A missing or empty vector table must not sink the keyword arm.
             .unwrap_or_else(|e| {
@@ -1607,7 +1689,8 @@ fn prune_removes_gone_rows_and_their_search_entries() {
         })
         .unwrap();
 
-        let rows = pending(25).unwrap();
+        let model = crate::embedder::DEFAULT_MODEL_LABEL;
+        let rows = pending(25, model).unwrap();
         let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(
             paths,
@@ -1620,9 +1703,112 @@ fn prune_removes_gone_rows_and_their_search_entries() {
         // server is actually available.
         mark_embedding_skipped(rows[2].id).unwrap();
         assert!(
-            pending(25).unwrap().iter().any(|r| r.path == "/tmp/old.png"),
+            pending(25, model).unwrap().iter().any(|r| r.path == "/tmp/old.png"),
             "a skipped row must stay pending or it never gets embedded"
         );
+
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+    }
+
+    /// BM7: a vector from a *different* model must be re-embedded, not silently
+    /// mixed into the same space.
+    #[test]
+    fn a_row_embedded_by_another_model_is_pending_again() {
+        let _guard = test_lock();
+        let db = std::env::temp_dir().join("xreenshoty-model-mismatch.db");
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+        std::env::set_var("XREENSHOTY_TEST_DB", &db);
+        with_conn(|_| Ok(())).unwrap();
+
+        with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO screenshots
+                     (path, created_at, width, height, source, ocr_boxes, embedded_at, embed_model)
+                 VALUES ('/tmp/old-model.png', 1, 1, 1, 'capture', '[]', 100, 'some-other-model')",
+                [],
+            )
+            .map_err(|e| format!("insert: {e}"))?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(
+            pending(25, crate::embedder::DEFAULT_MODEL_LABEL)
+                .unwrap()
+                .iter()
+                .any(|r| r.path == "/tmp/old-model.png"),
+            "a vector embedded by another model must be re-embedded"
+        );
+        assert!(
+            !pending(25, "some-other-model")
+                .unwrap()
+                .iter()
+                .any(|r| r.path == "/tmp/old-model.png"),
+            "the same vector is current for the model that produced it"
+        );
+
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+    }
+
+    /// BM4: a row inside its failure backoff window must be withheld; once the
+    /// window passes it returns so a transient fault still recovers.
+    #[test]
+    fn failing_rows_are_withheld_until_the_retry_time() {
+        let _guard = test_lock();
+        let db = std::env::temp_dir().join("xreenshoty-embed-backoff.db");
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+        std::env::set_var("XREENSHOTY_TEST_DB", &db);
+        with_conn(|_| Ok(())).unwrap();
+
+        let id = with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO screenshots
+                     (path, created_at, width, height, source, ocr_boxes, embed_retry_at)
+                 VALUES ('/tmp/backoff.png', 1, 1, 1, 'capture', '[]', 0)",
+                [],
+            )
+            .map_err(|e| format!("insert: {e}"))?;
+            Ok(conn.last_insert_rowid())
+        })
+        .unwrap();
+
+        // Backoff expired (epoch 0): the row is offered.
+        assert!(pending(25, crate::embedder::DEFAULT_MODEL_LABEL)
+            .unwrap()
+            .iter()
+            .any(|r| r.id == id));
+
+        // First real failure schedules a retry in the future.
+        let attempts = record_embed_failure(id).unwrap();
+        assert_eq!(attempts, 1);
+
+        assert!(
+            !pending(25, crate::embedder::DEFAULT_MODEL_LABEL)
+                .unwrap()
+                .iter()
+                .any(|r| r.id == id),
+            "a failed row must be withheld during its backoff window"
+        );
+
+        // A success clears the counter and the retry deadline.
+        with_conn(|conn| {
+            conn.execute(
+                "UPDATE screenshots SET embedded_at = 1, embed_model = ?1,
+                     embed_attempts = 0, embed_retry_at = NULL WHERE id = ?2",
+                params![crate::embedder::DEFAULT_MODEL_LABEL, id],
+            )
+            .map_err(|e| format!("update: {e}"))?;
+            Ok(())
+        })
+        .unwrap();
 
         for suffix in ["", "-wal", "-shm"] {
             std::fs::remove_file(format!("{}{suffix}", db.display())).ok();

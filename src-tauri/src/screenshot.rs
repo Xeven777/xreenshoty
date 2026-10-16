@@ -23,16 +23,50 @@ fn monitor_info(screen: &Screen) -> MonitorInfo {
     }
 }
 
+/// Expand a leading `~` against the user's home directory.
+///
+/// The save-folder placeholder is literally `~/Pictures`, but `PathBuf::from`
+/// treats `~` as an ordinary name segment: `create_dir_all("~/Pictures")`
+/// resolves against the process CWD and creates a directory actually called
+/// `~` (`$HOME/~/Pictures` when launched from a `.desktop` file). Only a
+/// leading `~` is special — a `~` anywhere else is a real filename character.
+pub(crate) fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
 pub(crate) fn resolve_dir(save_dir: Option<String>) -> Result<PathBuf, String> {
     if let Some(dir) = save_dir {
         let trimmed = dir.trim();
         if trimmed.is_empty() {
             return Err("Save directory is empty".to_string());
         }
-        Ok(PathBuf::from(trimmed))
+        Ok(expand_tilde(trimmed))
     } else {
         dirs::picture_dir().ok_or_else(|| "Could not resolve Pictures directory".to_string())
     }
+}
+
+/// Run a blocking body on the async runtime's blocking pool.
+///
+/// Capture, PNG encode, directory scans and the synchronous embedding HTTP call
+/// would otherwise run on the main thread (BM1) or occupy a tokio worker (BM2).
+/// Off-loading keeps the window responsive and the executor free.
+pub(crate) async fn offload<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("background task failed: {e}"))?
 }
 
 pub(crate) fn ensure_dir(dir: &Path) -> Result<(), String> {
@@ -135,20 +169,33 @@ pub(crate) fn save_png(image: screenshots::image::RgbaImage, dir: &Path, stem: &
 }
 
 #[tauri::command]
-pub fn list_monitors() -> Result<Vec<MonitorInfo>, String> {
-    let screens = Screen::all().map_err(|e| format!("Screen::all failed: {e}"))?;
-    Ok(screens.iter().map(monitor_info).collect())
+pub async fn list_monitors() -> Result<Vec<MonitorInfo>, String> {
+    offload(|| {
+        let screens = Screen::all().map_err(|e| format!("Screen::all failed: {e}"))?;
+        Ok(screens.iter().map(monitor_info).collect())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn default_save_dir() -> Result<String, String> {
-    Ok(resolve_dir(None)?
-        .to_string_lossy()
-        .to_string())
+pub async fn default_save_dir() -> Result<String, String> {
+    offload(|| {
+        Ok(resolve_dir(None)?
+            .to_string_lossy()
+            .to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn capture_fullscreen(
+pub async fn capture_fullscreen(
+    monitor_id: Option<u32>,
+    save_dir: Option<String>,
+) -> Result<Vec<String>, String> {
+    offload(move || capture_fullscreen_blocking(monitor_id, save_dir)).await
+}
+
+fn capture_fullscreen_blocking(
     monitor_id: Option<u32>,
     save_dir: Option<String>,
 ) -> Result<Vec<String>, String> {
@@ -237,7 +284,17 @@ pub fn screens_for_pointer() -> Result<(i32, i32, u32, u32), String> {
 }
 
 #[tauri::command]
-pub fn capture_region(
+pub async fn capture_region(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    save_dir: Option<String>,
+) -> Result<String, String> {
+    offload(move || capture_region_blocking(x, y, width, height, save_dir)).await
+}
+
+fn capture_region_blocking(
     x: i32,
     y: i32,
     width: u32,
@@ -320,7 +377,11 @@ fn active_window_rect() -> Result<(i32, i32, u32, u32), String> {
 }
 
 #[tauri::command]
-pub fn capture_active_window(save_dir: Option<String>) -> Result<String, String> {
+pub async fn capture_active_window(save_dir: Option<String>) -> Result<String, String> {
+    offload(move || capture_active_window_blocking(save_dir)).await
+}
+
+fn capture_active_window_blocking(save_dir: Option<String>) -> Result<String, String> {
     let dir = resolve_dir(save_dir)?;
     ensure_dir(&dir)?;
 
@@ -339,13 +400,17 @@ pub fn capture_active_window(save_dir: Option<String>) -> Result<String, String>
 /// leaves the picture intact rather than orphaning it.
 #[tauri::command]
 pub async fn delete_screenshot(path: String) -> Result<(), String> {
-    let clean = crate::db::forget(&path)?;
-    let p = std::path::PathBuf::from(&clean);
-    if p.is_file() {
-        std::fs::remove_file(&p).map_err(|e| format!("Could not delete {}: {e}", p.display()))?;
-        log::info!("deleted {}", p.display());
-    }
-    Ok(())
+    offload(move || {
+        let clean = crate::db::forget(&path)?;
+        let p = std::path::PathBuf::from(&clean);
+        if p.is_file() {
+            std::fs::remove_file(&p)
+                .map_err(|e| format!("Could not delete {}: {e}", p.display()))?;
+            log::info!("deleted {}", p.display());
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Hand a screenshot to the system image viewer.
@@ -354,47 +419,51 @@ pub async fn delete_screenshot(path: String) -> Result<(), String> {
 /// has configured for images is what they get.
 #[tauri::command]
 pub async fn open_file(path: String) -> Result<(), String> {
-    let p = std::path::PathBuf::from(&path);
-    if !p.is_file() {
-        return Err(format!("not a file: {path}"));
-    }
-    #[cfg(target_os = "linux")]
-    std::process::Command::new("xdg-open")
-        .arg(&p)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    #[cfg(target_os = "macos")]
-    std::process::Command::new("open")
-        .arg(&p)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    #[cfg(target_os = "windows")]
-    std::process::Command::new("explorer")
-        .arg(&p)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    offload(move || {
+        let p = std::path::PathBuf::from(&path);
+        if !p.is_file() {
+            return Err(format!("not a file: {path}"));
+        }
+        #[cfg(target_os = "linux")]
+        std::process::Command::new("xdg-open")
+            .arg(&p)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        #[cfg(target_os = "macos")]
+        std::process::Command::new("open")
+            .arg(&p)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        #[cfg(target_os = "windows")]
+        std::process::Command::new("explorer")
+            .arg(&p)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn open_folder(path: Option<String>) -> Result<(), String> {
-    let dir = resolve_dir(path)?;
-    ensure_dir(&dir)?;
-    #[cfg(target_os = "linux")]
-    let r = std::process::Command::new("xdg-open")
-        .arg(&dir)
-        .spawn();
-    #[cfg(target_os = "macos")]
-    let r = std::process::Command::new("open").arg(&dir).spawn();
-    #[cfg(target_os = "windows")]
-    let r = std::process::Command::new("explorer").arg(&dir).spawn();
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    let r = Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "open_folder not supported on this OS",
-    ));
-    r.map(|_| ()).map_err(|e| format!("Could not open folder: {e}"))?;
-    Ok(())
+pub async fn open_folder(path: Option<String>) -> Result<(), String> {
+    offload(move || {
+        let dir = resolve_dir(path)?;
+        ensure_dir(&dir)?;
+        #[cfg(target_os = "linux")]
+        let r = std::process::Command::new("xdg-open").arg(&dir).spawn();
+        #[cfg(target_os = "macos")]
+        let r = std::process::Command::new("open").arg(&dir).spawn();
+        #[cfg(target_os = "windows")]
+        let r = std::process::Command::new("explorer").arg(&dir).spawn();
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        let r = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "open_folder not supported on this OS",
+        ));
+        r.map(|_| ()).map_err(|e| format!("Could not open folder: {e}"))?;
+        Ok(())
+    })
+    .await
 }
 
 /// Stable FNV-1a hash. Used only as a cache filename, so it just has to be
@@ -445,6 +514,10 @@ fn thumb_cache_file(path: &Path, size: u32) -> Option<PathBuf> {
 /// decode, which is what made this worth fixing.
 #[tauri::command]
 pub async fn thumbnail(path: String, size: Option<u32>) -> Result<String, String> {
+    offload(move || thumbnail_blocking(path, size)).await
+}
+
+fn thumbnail_blocking(path: String, size: Option<u32>) -> Result<String, String> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     let size = size.unwrap_or(320).clamp(32, 1024);
@@ -485,11 +558,14 @@ pub async fn thumbnail(path: String, size: Option<u32>) -> Result<String, String
 /// Read separately from clearing so Settings can show the number instead of a
 /// button that silently does nothing when the cache is already empty.
 #[tauri::command]
-pub fn thumbnail_cache_size() -> Result<u64, String> {
-    let Some(dir) = thumb_cache_dir() else {
-        return Ok(0);
-    };
-    Ok(cache_size_in(&dir))
+pub async fn thumbnail_cache_size() -> Result<u64, String> {
+    offload(|| {
+        let Some(dir) = thumb_cache_dir() else {
+            return Ok(0);
+        };
+        Ok(cache_size_in(&dir))
+    })
+    .await
 }
 
 fn cache_size_in(dir: &Path) -> u64 {
@@ -514,13 +590,16 @@ fn cache_size_in(dir: &Path) -> u64 {
 /// `thumbnail` recreates its parent with `create_dir_all` and the caller may
 /// not have permission to unlink the directory from under another writer.
 #[tauri::command]
-pub fn clear_thumbnail_cache() -> Result<u64, String> {
-    let Some(dir) = thumb_cache_dir() else {
-        return Ok(0);
-    };
-    let freed = clear_cache_in(&dir);
-    log::info!("cleared thumbnail cache, freed {freed} bytes");
-    Ok(freed)
+pub async fn clear_thumbnail_cache() -> Result<u64, String> {
+    offload(|| {
+        let Some(dir) = thumb_cache_dir() else {
+            return Ok(0);
+        };
+        let freed = clear_cache_in(&dir);
+        log::info!("cleared thumbnail cache, freed {freed} bytes");
+        Ok(freed)
+    })
+    .await
 }
 
 fn clear_cache_in(dir: &Path) -> u64 {
@@ -593,6 +672,17 @@ mod thumbnail_tests {
         assert_ne!(second, third);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tilde_expands_against_home_but_is_otherwise_literal() {
+        let home = dirs::home_dir().expect("home dir");
+        // The placeholder value users actually type.
+        assert_eq!(expand_tilde("~/Pictures"), home.join("Pictures"));
+        assert_eq!(expand_tilde("~"), home);
+        // A ~ that is not the leading segment is a real filename character.
+        assert_eq!(expand_tilde("/tmp/~/Pictures"), PathBuf::from("/tmp/~/Pictures"));
+        assert_eq!(expand_tilde("notes~backup"), PathBuf::from("notes~backup"));
     }
 
     #[test]

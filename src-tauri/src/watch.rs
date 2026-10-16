@@ -68,7 +68,7 @@ pub fn sync(dirs: &[String]) -> usize {
             if trimmed.is_empty() {
                 return None;
             }
-            let path = PathBuf::from(trimmed);
+            let path = crate::screenshot::expand_tilde(trimmed);
             if !path.is_dir() {
                 log::warn!("watch: {trimmed} is not a directory, not watching");
                 return None;

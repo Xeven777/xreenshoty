@@ -30,12 +30,33 @@ function clampDelay(value: number) {
 
 /** Stored settings are user-editable and may predate a field, so coerce rather
  *  than trust. A `scanFolders` that is not an array of strings would otherwise
- *  reach `.map` and break the whole Settings tab. */
+ *  reach `.map` and break the whole Settings tab, a string `delaySecs` would
+ *  make the countdown arithmetic produce `NaN`, and a non-boolean
+ *  `notifyOnSave` would be read as truthy. Every field is validated, not just
+ *  the obvious one (M8). */
 function sanitise(stored: Partial<Settings>): Settings {
-  const scanFolders = Array.isArray(stored.scanFolders)
-    ? stored.scanFolders.filter((d): d is string => typeof d === "string")
-    : DEFAULT_SETTINGS.scanFolders
-  return { ...DEFAULT_SETTINGS, ...stored, scanFolders }
+  const raw = stored as Record<string, unknown>
+  const str = (v: unknown, fallback: string) =>
+    typeof v === "string" ? v : fallback
+  return {
+    saveDir: str(raw.saveDir, DEFAULT_SETTINGS.saveDir),
+    scanFolders: Array.isArray(raw.scanFolders)
+      ? raw.scanFolders.filter((d): d is string => typeof d === "string")
+      : DEFAULT_SETTINGS.scanFolders,
+    delaySecs:
+      typeof raw.delaySecs === "number"
+        ? clampDelay(raw.delaySecs)
+        : DEFAULT_SETTINGS.delaySecs,
+    shortcutFullscreen: str(
+      raw.shortcutFullscreen,
+      DEFAULT_SETTINGS.shortcutFullscreen
+    ),
+    shortcutWindow: str(raw.shortcutWindow, DEFAULT_SETTINGS.shortcutWindow),
+    notifyOnSave:
+      typeof raw.notifyOnSave === "boolean"
+        ? raw.notifyOnSave
+        : DEFAULT_SETTINGS.notifyOnSave,
+  }
 }
 
 export function useSettings() {

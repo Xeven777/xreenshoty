@@ -5,7 +5,7 @@ Local-first screenshot capture and later retrieval, fully offline. Match XFCE
 Screenshot behaviour for capture first; only then add local models for search.
 
 Status: Milestones 1–4, 5.0-5.6 and 6.1-6.3 implemented. Remaining:
-6.4 answer synthesis, 6.5 rerank if needed.
+6.4 answer synthesis, 6.5 rerank if needed, 7.x face grouping.
 
 ## Stack
 
@@ -24,9 +24,11 @@ Status: Milestones 1–4, 5.0-5.6 and 6.1-6.3 implemented. Remaining:
 
 All inference is local. Nothing leaves the machine.
 
-### Python: not required
+### Python: isolated, not required
 
-The whole AI stack can run **without Python in the app**:
+The Rust app talks plain HTTP to two localhost servers and shells out to two
+venv pythons. No Python runs in the webview or on the capture path; each is a
+separate process that owns its own environment:
 
 | Component | Runtime | Python? |
 |---|---|---|
@@ -34,11 +36,17 @@ The whole AI stack can run **without Python in the app**:
 | Answer model | Ollama (Go binary) over HTTP | No |
 | OCR | `tesseract` (C++) | No |
 | Vector search | sqlite-vec, statically linked into our Rust binary | No |
-| Voice (M6 only) | `cactus-needle` / Whistle | **Yes — isolated** |
+| Voice (M6) | `cactus-needle` / Whistle | **Yes — isolated** |
+| Faces (M7) | `onnxruntime` + 2 ONNX files | **Yes — isolated** |
 
-The Rust app talks plain HTTP to two localhost servers. Python appears only for
-voice in Milestone 6, as a separate process that the app shells out to; if that
-proves painful it is the one piece to cut.
+**The isolation is the point, not "no Python".** A Python face stack buys far
+more than a hand-written Rust one, and a venv is the cheapest way to keep it
+from leaking into the rest of the app. Each venv lives under
+`~/.local/share/xreenshoty/` alongside where the model files live in `~/apps/`.
+
+A missing venv degrades gracefully, exactly like `voice.rs` erroring with
+"cactus-needle not installed": the feature is skipped and logged, capture and
+search keep working.
 
 ---
 
@@ -348,6 +356,167 @@ Carry-over from earlier milestones (small, do them when convenient):
 
 ---
 
+## Milestone 7 — Face detection and identity grouping
+
+Adds a third retrieval modality. Screenshots containing faces (video calls,
+meeting tiles, shared photos) become groupable by person, so "every screenshot
+with Ravi in it" is one query instead of a scroll.
+
+This is a research story, not a feature toggle: grouping is three separate models
+plus one unsupervised step, each failing differently, and the last one is *not*
+a neural network. All of it runs in the indexer worker, off the capture path.
+
+### Decisions taken (researched, not assumed)
+
+**Detection, embedding and clustering are three stages. Collapsing them is the
+classic beginner mistake** — DeepFace and InsightFace make it look like one
+function call, which hides where the quality actually comes from.
+
+| Stage | Question | Output | Neural net? |
+|---|---|---|---|
+| Detection | "where are the faces?" | bbox + 5 keypoints | yes — YuNet, SCRFD |
+| Embedding | "this crop as a vector" | 512-d float | yes — ArcFace, EdgeFace |
+| Clustering | "which are the same person?" | cluster ids | **no** — geometry only |
+
+**EmbeddingGemma cannot do this, and that is settled research — do not retry
+it.** EmbeddingGemma is a *semantic* embedder (image-text contrastive): it
+encodes what an image is *about*. Face recognition needs identity-discriminative
+vectors, which only comes from a model trained with a margin loss over millions
+of identities.
+
+**FRoundation** (arXiv:2410.23831, Fraunhofer IGD) asked precisely this question
+— "are foundation models ready for face recognition?" — over DINOv2 and CLIP, and
+found pretrained foundation models **underperform architectures trained
+specifically for the task**; LoRA fine-tuning only reaches parity with training
+from scratch. arXiv:2411.12319 similarly finds CLIP needs explicit single-shot
+fine-tuning before it is usable at all.
+
+Concrete consequence: a **second, separate model**, stored in a **separate
+`vec0` table**. Face vectors are 512-d and screenshot vectors are 768-d, so the
+two cannot share a table, a KNN query, or a similarity score. Fusing the identity
+arm into hybrid search is a 7.6 concern, not a 7.0 one.
+
+**LFW is saturated. The benchmark that actually matters here is IJB-C.** Every
+candidate scores 99.x% on LFW (edge faces, studio quality). Our inputs are small,
+angled, low-contrast faces in dark-mode video tiles, which is exactly what
+IJB-B/C stress.
+
+| Tier | Detector | Recognizer | Params | LFW | IJB-B | IJB-C | License |
+|---|---|---|---|---|---|---|---|
+| **Cheap (default)** | **YuNet** 2026may | **EdgeFace-XS** (gamma=0.6) | **1.77 M** | **99.73** | **92.67** | **94.85** | MIT / BSD-3 |
+| Cheap, no export | YuNet 2026may | yakhyo MobileNetV3-Large | 3.52 M | 99.53 | — | — | MIT |
+| Heavy | SCRFD 10G-5GF | ArcFace R100 (`w600k_r50`) | ~66 M | 99.80 | — | — | non-comm. |
+
+EdgeFace won the compact track of IJCB 2023's Efficient Face Recognition
+competition (TBIOM 2024), at 154 MFLOPs and 1.77 M params. YuNet ships two ONNX
+exports: `face_detection_yunet_2023mar.onnx` (fixed input shape) and
+`face_detection_yunet_2026may.onnx` (symbolic dims). **Use 2026may with ONNX
+Runtime** — the 2023mar one infers only at its fixed shape. YuNet is MIT, and
+reaches 0.884 / 0.866 / 0.750 AP on WIDER val easy/medium/hard, detecting faces
+from roughly 10x10 up to 300x300 px.
+
+**EdgeFace publishes no ONNX weights.** Upstream ships `.pt` checkpoints only, so
+the cheap tier carries an explicit export step (or the third-party
+`yakhyo/edgeface-onnx`, BSD-3 weights). A fallback with no export step at all is
+**yakhyo/face-recognition**, which publishes ONNX directly in its v0.0.1 release
+(MIT; Sphere20 24.5 M params at 99.67 LFW).
+
+**Alignment is not optional — this is the trap that reads as "grouping is
+broken".** Recognition models expect a 112x112 crop warped so the eyes land at
+fixed pixel positions, because that is how they were trained. Feed a raw bbox
+crop and recall collapses *silently*: the same person lands near 0.55 similarity,
+which looks like a threshold problem rather than a preprocessing one. That is why
+the detector's 5 keypoints must be carried through — they *are* the anchor points
+for the affine warp.
+
+**ONNX Runtime, not PyTorch, at runtime.** `plan.md` already records ~2 GB RAM
+available; a torch import is ~1.5 GB RSS and 5-10 s to boot, evicting the 825 MB
+embedder. Export once, offline; never run torch in the app.
+
+**Clustering thresholds are not free parameters, and eps=.35 is not
+transferable.** Cosine distance is not threshold-free across models, so a
+default borrowed from a demo is a guess. A threshold is only valid when read as
+the *separation* between the same-person and different-person distributions,
+measured on our own corpus — never in isolation. Two conditions must both hold,
+both taken from `videre-core` (Apache-2.0, rusqlite — the same crates as this
+project):
+
+- A **minimum face side, ~80 px.** Sub-80 px faces embed into near-degenerate
+  vectors that cluster together regardless of identity — one huge mixed blob
+  that looks alarming and is mostly junk. Measured on real data: genuine person
+  clusters sat at 100 px and above, the junk cluster at ~60 px. Hold tiny faces
+  out as unassigned singletons rather than letting them form a blob.
+- An **`eps` derived from measured separation**, plus a linkage backstop. Two
+  clusters with similar centroids can still be different people — one library
+  merged two real identities at 0.37 centroid similarity while their
+  average-linkage distance was 0.84, far outside any sane `eps`. Failure modes
+  to expect: mega-blob (eps too high), dust (too many singletons), and merge
+  (centroid-only scoring).
+
+**Auto-labels are never ground truth.** Cluster ids are internal; a user-given
+name is the editable record. "Who is this?", renaming, and merging two clusters
+are user actions, not model output.
+
+**Opt-in, default off.** Face indexing is biometric-class work. It belongs behind
+a settings toggle with a plain-language explanation, and indexed faces must be
+deletable per cluster.
+
+### Risks
+
+- **R1 — small faces dominate.** Video-call tiles and sidebars mean most faces
+  are well under 80 px. If that holds, this arm is valuable but *thin*: size it
+  as an experiment, not a headline feature. Measure in 7.0 before writing any of
+  7.1-7.3.
+- **R2 — alignment quality.** Keypoint warping degrades on profile faces and
+  occlusions, and no small model is trained for them. Measure the same-person
+  similarity distribution separately for frontal vs profile before tuning eps.
+- **R3 — bootstrap offline.** The venv is created once, from pip, ~10-30 MB of
+  models. It must not silently break the offline guarantee or fail mysteriously
+  on a fresh machine: fail with a clear message, exactly like voice.rs does.
+- **R4 — GPU/RAM contention.** Never overlap the 825 MB embedder. The worker runs
+  the face stage after the embedding stage, CPU-only by design.
+- **R5 — `face-env` must not break `voice-env`.** Two venvs, two purposes, no
+  shared requirements. Verify both work from the same clean install.
+
+### Spike 7.0 (to run before any code)
+
+Measurements, in order. If 7.0 fails, stop and report rather than building on it.
+
+1. `onnxruntime` install size, venv size, cold boot time, RSS. Target < 200 MB.
+2. Model sizes actually on disk: `face_detection_yunet_2026may.onnx` plus one
+   recognizer. Target < 15 MB combined.
+3. **Census over the ~370 existing screenshots: how many contain at least one
+   face >= 80 px, and what is the face-size distribution?** This is the R1 gate
+   and the go/no-go on the whole milestone.
+4. Latency per image, CPU only, over that census.
+5. Cosine separation: same-person aligned pairs vs different-person pairs, one
+   histogram each. The `eps` actually chosen goes into this document with the
+   numbers behind it — not before.
+6. EdgeFace ONNX export verified against the `.pt` output on the same crop.
+
+### Work slices
+
+- [ ] **7.0 Spike** — the measurements above. Gates everything below it.
+- [ ] **7.1 Schema.** Idempotent, per the existing `add_column` PRAGMA rule. A
+      separate `face_vec` `vec0` table with **`distance_metric=cosine` stated
+      explicitly** (the default is L2, which is not a similarity), plus a cluster
+      table holding face ids and a user-given name. On any model change the face
+      rows must be droppable and rebuildable from the PNGs, never migrated.
+- [ ] **7.2 `face.rs`** — shells out to `face-env` python, mirroring `voice.rs`
+      (venv discovery, JSON over stdout, graceful missing-venv error). Expose
+      `min_face_px` as an env override so the R1 gate can be tuned without a
+      rebuild.
+- [ ] **7.3 Stage wiring in `indexer.rs`** — after the embedding stage, inside
+      the same batch, never blocking capture. Record the model name next to every
+      vector so the number has provenance.
+- [ ] **7.4 Clustering** — `eps` from the 7.0 numbers, with the 80 px gate.
+- [ ] **7.5 People view** — cluster list with a representative tile per cluster,
+      click-through to screenshots, rename and merge controls.
+- [ ] **7.6 "find me with <person>"** — KNN on `face_vec` seeded from one
+      reference face. Only build it if 7.0 says there is enough signal.
+
+---
+
 ## Rules
 
 - Build and verify one slice at a time. Do not start 5.2 before the 5.0 spike
@@ -355,6 +524,8 @@ Carry-over from earlier milestones (small, do them when convenient):
 - Capture is never blocked by inference. Queue work; never `await` a model on
   the capture path.
 - All inference local. No screenshot, query or audio leaves the machine.
+- Biometric templates stay local too, and face indexing is opt-in until 7.0
+  proves the small-face problem is solvable.
 - Files are the source of truth. Losing the DB must never lose a PNG.
 - Prefer deletion: no scaffolding for a later slice.
 

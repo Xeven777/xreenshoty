@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useState } from "react"
+import { memo, useCallback, useEffect, useRef, useState } from "react"
 import {
   ArrowsOut,
   CaretDown,
@@ -322,6 +322,7 @@ export function ShotPreview({
     null
   )
   const [failedPath, setFailedPath] = useState<string | null>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (!item) return
@@ -349,11 +350,61 @@ export function ShotPreview({
 
   useEffect(() => {
     if (!item) return
+    // Remember what had focus so it can be restored on close (M6).
+    const previouslyFocused =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null
+    // Move focus into the dialog so assistive tech stops reading the grid and
+    // Tab starts inside rather than walking the hidden background.
+    panelRef.current?.focus()
+
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose()
+      if (e.key === "Escape") {
+        onClose()
+        return
+      }
+      if (e.key !== "Tab") return
+      // Trap Tab within the dialog. Queried fresh each keypress because the
+      // Details section mounts new controls (and the copy button appears only
+      // once text loads).
+      const root = panelRef.current
+      if (!root) return
+      const focusable = Array.from(
+        root.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        )
+      ).filter((el) => el.offsetParent !== null)
+      if (focusable.length === 0) {
+        e.preventDefault()
+        root.focus()
+        return
+      }
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      const active = document.activeElement
+      if (e.shiftKey && (active === first || active === root)) {
+        e.preventDefault()
+        last.focus()
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault()
+        first.focus()
+      }
     }
     window.addEventListener("keydown", onKey)
-    return () => window.removeEventListener("keydown", onKey)
+
+    // Lock background scrolling behind the modal.
+    const scroller = document.querySelector<HTMLElement>(
+      "[data-ui-scroll-container]"
+    )
+    const prevOverflow = scroller?.style.overflow ?? ""
+    if (scroller) scroller.style.overflow = "hidden"
+
+    return () => {
+      window.removeEventListener("keydown", onKey)
+      if (scroller) scroller.style.overflow = prevOverflow
+      previouslyFocused?.focus()
+    }
   }, [item, onClose])
 
   return (
@@ -377,6 +428,8 @@ export function ShotPreview({
           onClick={onClose}
         >
           <motion.div
+            ref={panelRef}
+            tabIndex={-1}
             initial={{ opacity: 0, scale: 0.97, y: 10 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{
@@ -388,7 +441,7 @@ export function ShotPreview({
               transition: { duration: 0.12, ease: [0.4, 0, 1, 1] },
             }}
             transition={{ type: "spring", stiffness: 380, damping: 32 }}
-            className="mx-auto flex min-h-0 w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-white/10 bg-neutral-900 shadow-2xl"
+            className="mx-auto flex min-h-0 w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-white/10 bg-neutral-900 shadow-2xl outline-none"
             onClick={(e) => e.stopPropagation()}
           >
             <header className="flex shrink-0 items-center gap-2 px-4 py-3">
