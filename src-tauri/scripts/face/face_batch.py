@@ -103,7 +103,11 @@ def faces_of(path):
         lms[:, 0] *= fx
         lms[:, 1] *= fy
         crop = _align(img, lms)
-        x = ((crop.astype(np.float32) - 127.5) / 128.0).transpose(2, 0, 1)[None]
+        # SFace's ONNX export expects raw 0-255 BGR float: it normalises
+        # inside the graph. Pre-normalising (the classic (x-127.5)/128)
+        # double-normalises and collapses every vector into one degenerate
+        # blob (measured: corpus median cosine 0.857, cat == human).
+        x = crop[:, :, ::-1].astype(np.float32).transpose(2, 0, 1)[None]
         emb = rec.run([rout], {rin: x})[0][0]
         out.append(
             {

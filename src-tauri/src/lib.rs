@@ -3,6 +3,7 @@ use tauri_plugin_log::{Target, TargetKind};
 use tauri_plugin_opener::OpenerExt;
 
 pub mod db;
+mod cluster;
 mod embedder;
 mod face;
 mod indexer;
@@ -126,7 +127,9 @@ pub fn run() {
             voice::voice_start,
             voice::voice_stop,
             voice::voice_cancel,
-            face::face_status
+            face::face_status,
+            face::recluster_faces,
+            face::face_clusters
         ])
         .on_page_load(|webview, payload| {
             if webview.label() == "main" && matches!(payload.event(), PageLoadEvent::Finished) {

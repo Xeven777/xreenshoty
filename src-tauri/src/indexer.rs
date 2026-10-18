@@ -193,6 +193,17 @@ impl Indexer {
         tauri::async_runtime::spawn(indexer.run(app));
     }
 
+    /// Recluster after a face batch. Sync and fast (millisecond-scale), so it
+    /// runs inline — no spawn_blocking needed. Logs the outcome; errors
+    /// surface to the caller for the batch log line.
+    fn recluster_quietly(&self) -> Result<usize, String> {
+        let n = db::recluster_faces()?;
+        if n > 0 {
+            log::info!("indexer: reclustered {n} faces");
+        }
+        Ok(n)
+    }
+
     async fn run(self: Arc<Self>, app: AppHandle) {
         loop {
             tokio::select! {
@@ -380,6 +391,11 @@ impl Indexer {
                             // env picks them up on a later pass.
                             log::warn!("indexer: face batch failed: {e}");
                         }
+                    }
+                    // New faces change the geometry: recluster once per batch,
+                    // not per row. Cheap (millisecond-scale) and idempotent.
+                    if let Err(e) = self.recluster_quietly() {
+                        log::warn!("indexer: recluster failed: {e}");
                     }
                 } else {
                     log::debug!("indexer: face env incomplete, deferring face pass");

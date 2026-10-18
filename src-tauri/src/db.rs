@@ -166,12 +166,21 @@ fn ensure_face_schema(conn: &Connection) {
              box_y         REAL    NOT NULL,
              box_w         REAL    NOT NULL,
              box_h         REAL    NOT NULL,
-             score         REAL    NOT NULL
+             score         REAL    NOT NULL,
+             cluster_id    INTEGER
          );
-         CREATE INDEX IF NOT EXISTS idx_faces_screenshot ON faces (screenshot_id);",
+         CREATE INDEX IF NOT EXISTS idx_faces_screenshot ON faces (screenshot_id);
+         CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces (cluster_id);",
     ) {
         log::warn!("face table unavailable, face indexing disabled: {e}");
         return;
+    }
+    // Idempotent: existing installs predate `cluster_id`.
+    if let Err(e) = conn.execute("ALTER TABLE faces ADD COLUMN cluster_id INTEGER", []) {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            log::warn!("faces.cluster_id unavailable: {e}");
+        }
     }
 
     if let Err(e) = conn.execute_batch(&format!(
@@ -845,6 +854,119 @@ pub fn set_faces(id: i64, hits: &[crate::face::FaceHit], model: &str) -> Result<
         )
         .map_err(|e| format!("Face stamp failed: {e}"))?;
         tx.commit().map_err(|e| format!("Commit failed: {e}"))
+    })
+}
+
+/// One face row with its embedding, for clustering.
+pub struct ClusterInput {
+    pub face_id: i64,
+    pub embedding: Vec<f32>,
+}
+
+/// A cluster for the People view: representative face + member count.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FaceCluster {
+    pub cluster_id: i64,
+    pub face_ids: Vec<i64>,
+    pub screenshot_ids: Vec<i64>,
+}
+
+/// Reclusters every face in the DB: reads all embeddings, runs
+/// average-linkage at `crate::cluster::eps()`, writes `cluster_id` back.
+/// Singletons and empty runs get NULL (noise, not a group of one).
+///
+/// Called after a face batch and by the `recluster_faces` command. O(n^3)
+/// worst case in the merge scan — millisecond-scale at corpus sizes here.
+pub fn recluster_faces() -> Result<usize, String> {
+    let inputs: Vec<ClusterInput> = with_conn(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.id, v.embedding FROM faces f
+                 JOIN face_vec v ON v.rowid = f.id ORDER BY f.id",
+            )
+            .map_err(|e| format!("Face read failed: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                let id: i64 = r.get(0)?;
+                let bytes: Vec<u8> = r.get(1)?;
+                Ok((id, bytes))
+            })
+            .map_err(|e| format!("Face read failed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Face read failed: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, bytes)| ClusterInput {
+                face_id: id,
+                embedding: crate::embedder::from_f32_bytes(&bytes),
+            })
+            .collect())
+    })?;
+    if inputs.is_empty() {
+        return Ok(0);
+    }
+    let eps = crate::cluster::eps();
+    let vecs: Vec<Vec<f32>> = inputs.iter().map(|i| i.embedding.clone()).collect();
+    let assign = crate::cluster::cluster(&vecs, eps);
+    with_conn(|conn| {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Transaction failed: {e}"))?;
+        tx.execute("UPDATE faces SET cluster_id = NULL", [])
+            .map_err(|e| format!("Cluster clear failed: {e}"))?;
+        // Cluster ids from `cluster()` are positional-loop locals; remap to
+        // 1-based ids so NULL stays the only "no group" value in the column.
+        let mut written = 0;
+        for (input, slot) in inputs.iter().zip(assign.iter()) {
+            if let Some(s) = slot {
+                tx.execute(
+                    "UPDATE faces SET cluster_id = ?1 WHERE id = ?2",
+                    params![(*s as i64) + 1, input.face_id],
+                )
+                .map_err(|e| format!("Cluster write failed: {e}"))?;
+                written += 1;
+            }
+        }
+        tx.commit().map_err(|e| format!("Commit failed: {e}"))?;
+        Ok(written)
+    })
+}
+
+/// Clusters for the People view, largest first. Screenshot ids are deduped
+/// so "this person appears in N shots" reads correctly.
+pub fn face_clusters() -> Result<Vec<FaceCluster>, String> {
+    with_conn(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT cluster_id, id, screenshot_id FROM faces
+                 WHERE cluster_id IS NOT NULL ORDER BY cluster_id, id",
+            )
+            .map_err(|e| format!("Cluster read failed: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            })
+            .map_err(|e| format!("Cluster read failed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Cluster read failed: {e}"))?;
+        let mut out: Vec<FaceCluster> = vec![];
+        for (cid, fid, sid) in rows {
+            match out.last_mut() {
+                Some(c) if c.cluster_id == cid => {
+                    c.face_ids.push(fid);
+                    if !c.screenshot_ids.contains(&sid) {
+                        c.screenshot_ids.push(sid);
+                    }
+                }
+                _ => out.push(FaceCluster {
+                    cluster_id: cid,
+                    face_ids: vec![fid],
+                    screenshot_ids: vec![sid],
+                }),
+            }
+        }
+        out.sort_by_key(|c| std::cmp::Reverse(c.face_ids.len()));
+        Ok(out)
     })
 }
 
@@ -2051,6 +2173,55 @@ fn prune_removes_gone_rows_and_their_search_entries() {
                 .any(|r| r.id == id && r.needs_faces),
             "a model change must re-offer the row"
         );
+
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+    }
+
+    /// 7.4: near-identical embeddings land in one cluster, the outlier stays
+    /// NULL noise, and `face_clusters` reports largest-first.
+    #[test]
+    fn recluster_groups_near_duplicates_and_leaves_noise() {
+        let _guard = test_lock();
+        let db = std::env::temp_dir().join("xreenshoty-recluster.db");
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+        std::env::set_var("XREENSHOTY_TEST_DB", &db);
+        with_conn(|_| Ok(())).unwrap();
+
+        let mk_hit = |seed: f32| crate::face::FaceHit {
+            box_xywh: [0.0, 0.0, 100.0, 100.0],
+            score: 0.9,
+            embedding: (0..crate::face::FACE_DIM)
+                .map(|i| (seed + i as f32 * 0.001).sin())
+                .collect(),
+        };
+        let id = with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO screenshots
+                     (path, created_at, width, height, source, ocr_boxes)
+                 VALUES ('/tmp/recluster.png', 1, 10, 10, 'capture', '[]')",
+                [],
+            )
+            .map_err(|e| format!("insert: {e}"))?;
+            Ok(conn.last_insert_rowid())
+        })
+        .unwrap();
+
+        // Two near-identical + one far outlier in a single screenshot row.
+        let mut far = mk_hit(50.0);
+        far.box_xywh = [200.0, 0.0, 100.0, 100.0];
+        set_faces(id, &[mk_hit(1.0), mk_hit(1.01), far], crate::face::FACE_MODEL).unwrap();
+
+        let written = recluster_faces().unwrap();
+        assert_eq!(written, 2, "the pair must cluster, the outlier must not");
+
+        let clusters = face_clusters().unwrap();
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].face_ids.len(), 2);
+        assert_eq!(clusters[0].screenshot_ids, vec![id]);
 
         for suffix in ["", "-wal", "-shm"] {
             std::fs::remove_file(format!("{}{suffix}", db.display())).ok();

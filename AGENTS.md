@@ -333,6 +333,11 @@ already `tsc -b` — do not "simplify" it back to `--noEmit`.
   - **YuNet's 2026may export breaks in raw ORT** (dynamic-shape `Add_44`
     broadcast failure on non-stride-32 inputs; outputs raw per-stride anchors,
     not `[N, 15]` rows). 2026may exists for OpenCV 5.x's internal engine only.
+  - **SFace's ONNX expects RAW 0-255 BGR float — never pre-normalise.**
+    Normalisation is baked inside the graph. The classic `(x-127.5)/128` on
+    top double-normalises and collapses every vector into one degenerate blob
+    (measured: corpus median cosine 0.857, cat == human, one 47-face cluster
+    at every eps). Feed `crop[:, :, ::-1].astype(float32)` straight in.
 - **Files are the source of truth, not the DB.** Milestone 4 must keep PNGs in
   Pictures; SQLite is metadata only.
 - **Metadata is recorded in `save_png`, not per capture mode.** All three modes

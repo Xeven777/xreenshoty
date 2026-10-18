@@ -271,6 +271,19 @@ fn face_status_blocking() -> Result<FaceStatus, String> {
     })
 }
 
+/// Manual re-run from Settings: reclusters every face at the current eps.
+/// Fast enough to run inline (millisecond-scale).
+#[tauri::command]
+pub async fn recluster_faces() -> Result<usize, String> {
+    crate::screenshot::offload(crate::db::recluster_faces).await
+}
+
+/// Cluster list for the People view, largest first.
+#[tauri::command]
+pub async fn face_clusters() -> Result<Vec<crate::db::FaceCluster>, String> {
+    crate::screenshot::offload(crate::db::face_clusters).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

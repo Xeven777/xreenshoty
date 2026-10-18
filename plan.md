@@ -516,7 +516,15 @@ Measurements, in order. If 7.0 fails, stop and report rather than building on it
 - [x] **7.3 Stage wiring in `indexer.rs`** — after embeddings, opt-in
       `FACE_INDEXING` flag, rows stamped attempted on success only. Plus the
       Settings toggle + readiness readout. Done 2026-10-16.
-- [ ] **7.4 Clustering** — `eps` from the 7.0 numbers, with the 80 px gate.
+- [x] **7.4 Clustering** — DONE 2026-10-18: average-linkage agglomerative in
+      new `cluster.rs` (`DEFAULT_EPS=0.5`, override via
+      `XREENSHOTY_FACE_CLUSTER_EPS`), `faces.cluster_id` + idempotent schema,
+      `db::recluster_faces` + `db::face_clusters`, indexer reclusters once per
+      face batch, `recluster_faces`/`face_clusters` commands registered.
+      Calibration: eps 0.5 → 13 clusters / 43 faces / 26 singletons on 69
+      faces; reference identity stable 0.4→0.52, over-merges at 0.6. Trap
+      fixed en route: SFace ONNX expects raw 0-255 BGR (double-normalising
+      collapsed everything to median cosine 0.857; AGENTS.md).
 - [ ] **7.5 People view** — cluster list with a representative tile per cluster,
       click-through to screenshots, rename and merge controls.
 - [ ] **7.6 "find me with <person>"** — KNN on `face_vec` seeded from one
