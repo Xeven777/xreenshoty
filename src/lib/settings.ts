@@ -8,6 +8,8 @@ export interface Settings {
   shortcutFullscreen: string
   shortcutWindow: string
   notifyOnSave: boolean
+  /** Opt-in face indexing (Milestone 7). Off by default; biometric-class. */
+  faceIndexing: boolean
 }
 
 const KEY = "xreenshoty.settings"
@@ -19,6 +21,7 @@ export const DEFAULT_SETTINGS: Settings = {
   shortcutFullscreen: "Control+Shift+S",
   shortcutWindow: "Control+Shift+W",
   notifyOnSave: true,
+  faceIndexing: false,
 }
 
 export const MAX_DELAY = 30
@@ -56,6 +59,10 @@ function sanitise(stored: Partial<Settings>): Settings {
       typeof raw.notifyOnSave === "boolean"
         ? raw.notifyOnSave
         : DEFAULT_SETTINGS.notifyOnSave,
+    faceIndexing:
+      typeof raw.faceIndexing === "boolean"
+        ? raw.faceIndexing
+        : DEFAULT_SETTINGS.faceIndexing,
   }
 }
 

@@ -1,16 +1,38 @@
-import { useState } from "react"
-import { Camera, Gear, Keyboard, MagnifyingGlass } from "@phosphor-icons/react"
+import { useEffect, useState } from "react"
+import { isTauri } from "@tauri-apps/api/core"
+import {
+  Camera,
+  Gear,
+  Keyboard,
+  MagnifyingGlass,
+  Users,
+} from "@phosphor-icons/react"
 
 import { Capture } from "@/components/capture"
 import { IndexIndicator } from "@/components/index-indicator"
+import { People } from "@/components/people"
 import { Search } from "@/components/search"
 import { SettingsPanel } from "@/components/settings-panel"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useSettings } from "@/lib/settings"
+import { setFaceIndexing } from "@/lib/screenshot"
 
 export default function App() {
   const { settings, update } = useSettings()
   const [shortcutError, setShortcutError] = useState<string | null>(null)
+  const [tab, setTab] = useState("capture")
+  const tauri = isTauri()
+
+  // Push the face opt-in from here, not from the Settings panel: Rust holds no
+  // settings state, so this flag lives in an AtomicBool that starts `false` on
+  // every launch. SettingsPanel is not keepMounted, so a push from there only
+  // ever happens if the user happens to open that tab — leaving People showing
+  // a full UI (it reads localStorage) while the indexer was never told to do
+  // any face work. Same first-call-landing rule as `set_scan_folders`.
+  useEffect(() => {
+    if (!tauri) return
+    void setFaceIndexing(settings.faceIndexing).catch(() => undefined)
+  }, [tauri, settings.faceIndexing])
 
   return (
     <div className="mx-auto w-full max-w-5xl space-y-6 p-6">
@@ -32,7 +54,11 @@ export default function App() {
         <IndexIndicator />
       </div>
 
-      <Tabs defaultValue="capture" className="gap-4">
+      <Tabs
+        value={tab}
+        onValueChange={(value) => setTab(String(value))}
+        className="gap-4"
+      >
         <TabsList>
           <TabsTrigger value="capture">
             <Camera data-icon="inline-start" />
@@ -41,6 +67,10 @@ export default function App() {
           <TabsTrigger value="search">
             <MagnifyingGlass data-icon="inline-start" />
             Search
+          </TabsTrigger>
+          <TabsTrigger value="people">
+            <Users data-icon="inline-start" />
+            People
           </TabsTrigger>
           <TabsTrigger value="settings">
             <Gear data-icon="inline-start" />
@@ -60,6 +90,15 @@ export default function App() {
             results survive a tab round-trip. */}
         <TabsContent value="search" keepMounted>
           <Search />
+        </TabsContent>
+
+        {/* keepMounted so the selected person and any "find similar" results
+            survive a tab round-trip; it refetches when the tab is opened. */}
+        <TabsContent value="people" keepMounted>
+          <People
+            faceIndexing={settings.faceIndexing}
+            active={tab === "people"}
+          />
         </TabsContent>
 
         <TabsContent value="settings">

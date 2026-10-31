@@ -9,10 +9,10 @@ Local-first screenshot capture for Linux desktops. Tauri 2 + React 19 + Tailwind
 Screenshots land in the user's Pictures folder; OCR/semantic search come later
 (see `plan.md` for milestones). Everything must stay offline.
 
-Status: Milestones 1–4 and 5.1/5.2/5.5 implemented. Keyword search (FTS5 over
-OCR text) works against all 370 screenshots, and **image embeddings work** via
-`/v1/embeddings` — see the trap below for the exact shape. No Python is needed
-for the AI stack.
+Status: Milestones 1–4, 5.0-5.6, 6.1-6.3 and 7.0-7.6 (face indexing + People
+view + search-by-person, opt-in) implemented. Remaining: 6.4 answer synthesis,
+6.5 rerank if needed. OCR runs on Indra OCR 1.1.2 (the `ocr-env` venv), not
+tesseract — see the OCR runtime section below.
 
 ## Embedding runtime (verified — do not re-derive)
 
@@ -127,11 +127,12 @@ Ollama cannot be used for this model at all: its `/api/embed` is text-only.
   **6/6**, cap-128 only 5/6. Override with `XREENSHOTY_IMAGE_MAX_TOKENS`.
   Earlier "27s/image" readings were contaminated by two llama-servers sharing
   the GPU -- always confirm only one is running before trusting a timing.
-- **Parallelism: OCR yes, batched embeddings no.** tesseract is a subprocess,
-  so 4 at a time is a real 1.9x (0.95 -> 0.50 s/image on 12 cores). Packing 8
-  images into one `/v1/embeddings` request measured **0.96x** -- the GPU is
-  already saturated, so a batch just blocks until the slowest finishes. Keep
-  one image per request and per-image timings for free.
+- **Parallelism: OCR yes, batched embeddings no.** Indra OCR runs as a batch
+  subprocess (one interpreter, one pass over the batch), and the multi-process
+  worker pool in `convert_many` is what makes it 7.35 img/s at 4 cores.
+  Packing 8 images into one `/v1/embeddings` request measured **0.96x** -- the
+  GPU is already saturated, so a batch just blocks until the slowest finishes.
+  Keep one image per request and per-image timings for free.
 - **The app owns the llama-server process.** `embedder::Config::discover()` finds
   the binary/model under `~/apps`, overridable via `XREENSHOTY_LLAMA_SERVER`,
   `XREENSHOTY_EMBED_MODEL`, `XREENSHOTY_EMBED_MMPROJ`, `XREENSHOTY_EMBED_DEVICE`.
@@ -190,6 +191,34 @@ Ollama cannot be used for this model at all: its `/api/embed` is text-only.
   in the webview's `localStorage` and Rust holds no state — so the frontend calls
   `set_scan_folders` with the real list once settings load and on every change. A
   custom `saveDir` therefore depends on that first call landing.
+- **Any opt-in flag must be pushed from an always-mounted component.** The face
+  toggle had the same rule as `set_scan_folders` but was pushed from
+  `SettingsPanel`, which is **not** `keepMounted`. Rust's `FACE_INDEXING` is an
+  `AtomicBool` that starts `false` every launch, so unless the user happened to
+  open Settings that session it stayed false, `pending()` offered no face work,
+  and 1104 screenshots were never face-indexed. Meanwhile `People` reads
+  `localStorage` and rendered a complete UI, so the feature looked enabled while
+  doing nothing — progress bar at 0, Re-cluster instant, no logs. The push now
+  lives in `App.tsx`. Same lesson as the folders: a stateful Rust flag is only
+  as good as the mount point that sets it, and "Settings did it" is not a mount
+  point.
+- **A log line below the filter is a feature that fails silently.** The
+  "face env incomplete" path was `log::debug!` while the target filters at
+  `LevelFilter::Info`, so a missing venv or ONNX model disabled face indexing
+  with *nothing at all* in the log. Anything that disables a whole stage is
+  `warn` and names what is missing.
+- **`tauri-plugin-log` tags JS records with the target `webview`.** The log
+  filter allowed only `tauri_native_lib*`/`xreenshoty*` (to bury `ureq`), which
+  silently dropped *every* frontend line — including the crash report. A filter
+  written for Rust crates is a filter that deletes webview logs; allow
+  `WEBVIEW_TARGET` explicitly.
+- **A black window with a live process means a webview throw, not a Rust
+  panic.** `body` carries the app background, so an unmounted React tree looks
+  identical to a hang. `ErrorBoundary` in `main.tsx` turns it into a visible
+  message and logs it. The first real catch: base-ui's `DropdownMenuLabel` is a
+  `Menu.GroupLabel` and throws `MenuGroupContext is missing` unless it sits
+  inside a `DropdownMenuGroup` — used bare inside `DropdownMenuContent` it
+  killed the whole app on first click.
 - **The indexer must chain on work done, not row count.** A full batch whose
   rows could not be processed (model still loading) returns identically on the
   next query, so re-notifying on `rows.len()` spins the worker in a tight loop
@@ -231,6 +260,70 @@ Ollama cannot be used for this model at all: its `/api/embed` is text-only.
 - **Indexing never blocks capture.** `save_png` writes the row and calls
   `indexer::poke()`, which only wakes the worker. `indexer::APP` is a module-level
   `OnceLock<AppHandle>` so capture commands do not need one just to forward it.
+
+## OCR runtime (verified — do not re-derive)
+
+Indra OCR 1.1.2 replaced tesseract 5.5.0. It is a 1M-parameter ONNX model that
+runs on CPU, reads 80+ languages, and keeps the line structure of a page.
+
+```bash
+./scripts/setup-ocr.sh    # creates the venv + downloads the models (idempotent)
+```
+
+```
+venv   ~/.local/share/xreenshoty/ocr-env/bin/python   (indra-ocr 1.1.2)
+models ~/apps/models/indra-ocr                        (73 MB, revision v1.1.0)
+```
+
+The app runs the engine through `src-tauri/scripts/ocr/ocr_batch.py`: JSON list
+of paths on stdin, one JSON document on stdout. The models are loaded **once per
+batch**, not once per screenshot.
+
+Measured on this box (i5-12450HX, 8 physical cores, 12 threads), 34 real
+screenshots:
+
+| | tesseract 5.5 | Indra OCR |
+|---|---|---|
+| Throughput, 4 workers | 0.50 s/image (2 img/s) | **0.136 s/image (7.35 img/s)** |
+| Unique words over 34 shots | 1604 | **2149** |
+| Reading | "GO TO ASSESSME!" | "GO TO ASSESSMENT" |
+
+Six traps, each of which looks like a different bug:
+
+1. **More ONNX threads make a page *slower* here.** This CPU is a hybrid
+   P/E-core design, so ORT threads land on the slow cores: threads=1 measured
+   267 ms/image, threads=4 measured 535 ms, threads=8 measured 986 ms. The
+   answer is one *single-threaded worker process* per core, which is exactly
+   what `indra_ocr.convert_many` does. Four workers measured 7.35 img/s
+   against 1.96 img/s for a single 4-thread process.
+2. **`convert_many` re-imports the caller's `__main__` in every worker.** Without
+   an `if __name__ == "__main__":` guard each worker re-runs the whole batch:
+   a fork bomb that keeps running after the benchmark exits and silently
+   poisons every measurement taken while it is alive (it made one benchmark
+   look like threads=1 got 2x slower). Guard it, and check the load average
+   before trusting a timing — the same lesson as the two llama-servers sharing
+   the GPU.
+3. **Indra boxes *lines*, not words.** The per-character x positions exist in
+   `OrtOCR.recognize`'s internals but are not exposed on `Page.lines`, and
+   reaching into internals breaks on the next `indra-ocr` release. So a line's
+   width is divided between its words by character count: a real word order
+   and a real word count, with boxes that are a **proportional guess**. Never
+   draw them. `ocr_word_count` stays a word count because of this.
+4. **`conf` is 0-1, not 0-100.** tesseract's TSV conf was 0-100; the stored
+   blob keeps that scale, so `ocr.rs` multiplies by 100 on the way in.
+5. **`model_dir(path=...)` never downloads and raises `ModelError` on a
+   missing file.** Always pass the path *and* check the files up front
+   (`ocr::models_present`), or the first run would reach for Hugging Face at
+   runtime — which breaks the offline rule. The app sets
+   `INDRA_OCR_MODEL_DIR` and `HF_HUB_OFFLINE=1` to be sure.
+6. **`page.source == "error"` is a failure, not an empty page.** A decode
+   error yields an error page with a note; recording it as "no text found"
+   would mark a perfectly good screenshot as text-free forever.
+
+Cost to know: each worker holds about 430 MB resident (the models plus the
+language models), so four workers peak around 1.7 GB. Six and eight workers
+measured no faster and cost more. `XREENSHOTY_OCR_CORES` overrides the
+default of 4.
 
 ## Commands
 
@@ -307,6 +400,21 @@ already `tsc -b` — do not "simplify" it back to `--noEmit`.
   required so normal typing is never hijacked.
 - **Settings persist in `localStorage`** under `xreenshoty.settings`; session
   history under `xreenshoty.history`. Rust holds no state.
+- **OCR is one subprocess for the whole batch.** `ocr::run_batch` sends the
+  batch's paths to `scripts/ocr/ocr_batch.py` on stdin and reads one JSON
+  document back, so the engine loads its models once per batch instead of once
+  per screenshot. Both pipes are drained on threads while the parent polls: a
+  batch of 25 dense screenshots writes more than 64 KB to stdout alone, and a
+  parent that reads only after the child exits deadlocks it mid-write.
+- **A broken OCR must not be offered as work.** OCR rows sort first
+  (`ORDER BY needs_ocr DESC`), so offering rows the environment cannot handle
+  pins them at the head of the queue and the embedding pass never sees a row
+  again — the library silently stops being visually searchable. `db::pending`
+  takes an `ocr_enabled` flag and offers no OCR work at all when it is false.
+  A *batch-level* failure (crashing script, corrupt models) is different from
+  a bad file: the rows are left unstamped so a fixed environment picks them up,
+  and the indexer backs off for 5 minutes so they do not pin the queue in the
+  meantime. A per-file failure is stamped as attempted, like tesseract's was.
 - **Voice is push-to-talk through `voice.rs`.** `voice_start` spawns
   `pw-record` at 16 kHz mono (`arecord -f cd` fallback), `voice_stop` ends it
   with SIGTERM so the recorder flushes a valid WAV header -- SIGKILL leaves a
@@ -315,6 +423,93 @@ already `tsc -b` — do not "simplify" it back to `--noEmit`.
   `needle.transcribe` returns a dict with `"text"`), with `HF_HUB_OFFLINE=1`
   so it stays offline against the `~/.cache` weights. Temp WAVs live in
   `temp_dir()` and are deleted after transcribe/cancel.
+- **Faces: YuNet + SFace through the `face-env` venv (`face.rs`, M7).** Detection
+  is `cv2.FaceDetectorYN` on the **2023mar** YuNet (fixed 640x640); recognition is
+  raw `onnxruntime` on SFace (128-d). Both ONNX files live in `~/apps/models`.
+  The 5-point landmarks drive an affine warp to the 112x112 ArcFace template —
+  **never feed bbox crops to the recognizer** (silently bad similarity). Faces
+  under 80 px are held out (`XREENSHOTY_FACE_MIN_PX`): they embed near-identically
+  regardless of identity and become one junk cluster. Opt-in via the Settings
+  toggle (`set_face_indexing`); census on this box is 40/397 images. Traps:
+  - **SFace's ONNX spews ~80 KB of `Initializer ... in graph inputs` stderr per
+    session.** That is larger than a Linux pipe's 64 KB buffer, so a parent that
+    reads pipes only after the child exits deadlocks forever (found the hard way).
+    Two fixes are both load-bearing: the script silences ORT's C++ logger, and
+    `face::extract` drains stdout/stderr on threads *while* polling.
+  - **`ort.set_default_logger_severity` takes 0..4, not a `logging` level.**
+    `logging.ERROR` (40) raises "Invalid logging severity" — swallowed by a bare
+    `except: pass` this looks like a working fix while writing all 80 KB anyway.
+  - **YuNet's 2026may export breaks in raw ORT** (dynamic-shape `Add_44`
+    broadcast failure on non-stride-32 inputs; outputs raw per-stride anchors,
+    not `[N, 15]` rows). 2026may exists for OpenCV 5.x's internal engine only.
+  - **SFace's ONNX expects RAW 0-255 BGR float — never pre-normalise.**
+    Normalisation is baked inside the graph. The classic `(x-127.5)/128` on
+    top double-normalises and collapses every vector into one degenerate blob
+    (measured: corpus median cosine 0.857, cat == human, one 47-face cluster
+    at every eps). Feed `crop[:, :, ::-1].astype(float32)` straight in.
+- **vec0 `distance` on a `distance_metric=cosine` table is `1 - cos`, not L2.**
+  Measured: two orthogonal unit vectors return `distance = 1.0`. So similarity
+  is `1 - distance`. `SearchHit::visual` was calling `l2_to_cosine` on that
+  value (wrong), which is why raw cosine in tooltips read ~0.99 for everything
+  — fixed to `1.0 - distance`, guarded by
+  `search_by_face_ranks_the_seed_screenshot_first`. `l2_to_cosine` now only
+  interprets legacy L2 tables. Ranking was never affected (the transform is
+  monotonic), only the displayed/absolute number.
+- **`DEFAULT_EPS` is 0.55, and `recluster_faces` returns faces, not clusters.**
+  Raised from 0.5 on 2026-11-01 once the corpus reached 375 faces: 50 clusters /
+  280 clustered faces / 95 singletons, against 54 / 267 / 108 at 0.5. 0.6 is the
+  measured over-merge point here, so do not raise it further without labelled
+  pairs. `db::recluster_faces` returns the **number of face rows written into a
+  cluster** (280), not the cluster count (50) — that is why the toast reads
+  "N faces in M people". `./scripts/setup-face.sh` creates the `face-env` venv
+  and fetches both ONNX files; `face_status` reports which of venv/script/models
+  is missing. It takes no venv override on purpose — `face.rs` looks only at
+  `<data-local>/xreenshoty/face-env/bin/python`, so an install elsewhere would
+  succeed and then be invisible to the app.
+  Reclustering is a pure DB function, so a one-off `src/bin` can run it without
+  the window; `dbcheck` is read-only by design.
+- **Cluster ids must be stable across reclusters, or names and merges die.**
+  `cluster()` returns positional labels that scramble every run. `recluster_faces`
+  therefore maps each new group onto the previous `cluster_id` it overlaps most
+  (largest groups claim first; fresh ids start above the global max), and it
+  replays the user's merges from `face_links` through a union-find *after* the
+  algorithm's own grouping — otherwise a manual merge is silently undone by the
+  next face batch, which is exactly when a user would think it worked.
+- **`faces.id` is reused on installs that predate `AUTOINCREMENT`, and vec0 has
+  no UPSERT.** A vector orphaned by a face deleted without it sits on a rowid
+  the next detected face will take; the `INSERT INTO face_vec` then fails with
+  `UNIQUE constraint failed on face_vec primary key`, `set_faces` rolls back
+  before stamping `face_indexed_at`, so the indexer re-offers that screenshot --
+  and reclusters the whole library -- on every pass. `set_faces` deletes the
+  vector row before inserting, and `ensure_face_schema` purges orphans on open.
+  Regression test: `a_reused_face_rowid_survives_an_orphaned_vector`.
+- **Add a column before you index it.** `ensure_face_schema` once created
+  `idx_faces_cluster ON faces (cluster_id)` in the same batch as `CREATE TABLE
+  IF NOT EXISTS faces`. On a pre-7.4 database the table already exists *without*
+  that column, so the index failed, the whole batch errored, and the early
+  return meant the `ALTER TABLE ADD COLUMN` never ran: face indexing announced
+  itself "disabled" forever on precisely the installs needing the migration. The
+  column is added first, then indexed. Regression test:
+  `a_pre_74_faces_table_is_migrated_on_open`.
+- **Reclustering is instant, so the People progress bar tracks *detection*, not
+  clustering.** At 69 faces `recluster_faces` is sub-millisecond, and it only
+  regroups vectors that already exist — so a spinner on "Re-cluster" flashes
+  for no frame and the button looks broken. The honest progress signal is
+  `screenshots_indexed / screenshots_total`, polled every 2 s while the People
+  tab is open and still short of done. `face_progress` keys the numerator off
+  `face_indexed_at` (recorded "attempted", like `ocr_boxes`), because keying
+  off the face-row count would sit at zero on a face-free library forever.
+  `toastReclustered` reports the real outcome so the button always answers.
+  The indexer only reclusters when a face batch actually stored a face
+  (`should_recluster`): a pass that wrote nothing still rewrote every
+  `cluster_id` and logged `reclustered N faces`, which reads as progress and
+  hid a failing store.
+- **Deleting a person must not un-stamp the screenshots.** `forget_cluster`
+  removes their faces, vectors, name row and merge links and recomputes the
+  affected `face_count`s, but leaves `face_indexed_at` alone. Un-stamping would
+  make the next indexer pass re-detect exactly the person the user deleted;
+  only a face-model change brings them back. Regression test:
+  `forgetting_a_person_removes_faces_but_keeps_screenshots`.
 - **Files are the source of truth, not the DB.** Milestone 4 must keep PNGs in
   Pictures; SQLite is metadata only.
 - **Metadata is recorded in `save_png`, not per capture mode.** All three modes

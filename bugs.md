@@ -3,9 +3,9 @@
 Findings only. Baseline: `bun run typecheck` and `bun run lint` are both clean,
 and `bun run build` succeeds.
 
-Fixed since the original pass: **H1, H2, H3, M1, M3, M5, M7, BH1, BH2, BH3, BM3,
-BM4, BM6, BM9, BM10, L8, L9, L10** (18 of 43). Each is marked **Fixed** below.
-Everything else is still open.
+Fixed since the original pass: **H1, H2, H3, M1, M2, M3, M5, M7, BH1, BH2, BH3,
+BM3, BM4, BM6, BM9, BM10, L8, L9, L10** (19 of 43). Each is marked **Fixed**
+below. Everything else is still open.
 
 Contents:
 
@@ -15,7 +15,7 @@ Contents:
    own pass; where it is cited in the frontend section it was only to confirm a
    claim, and vice versa.
 
-Open: 1 high, 10 medium, 22 low (33 of 43).
+Open: 0 high, 10 medium, 22 low (32 of 43).
 
 ---
 
@@ -136,7 +136,7 @@ _handled_ rather than a "has this ever run" boolean. Editing the save folder now
 re-runs `importExisting` + `refresh`. Import is already idempotent (dedupes on
 the UNIQUE `path`), so re-running on every change is free.
 
-### M2. Changing a shortcut can leave the _old_ accelerator registered forever
+### M2. Changing a shortcut can leave the _old_ accelerator registered forever — **Fixed**
 
 `src/components/capture.tsx:292-321`
 
@@ -158,9 +158,35 @@ shortcut while the previous bind is still in flight:
 Result: the abandoned accelerator stays registered for the process lifetime and
 still fires `actionsRef.current.fullscreen?.()`. Rapid edits stack several.
 
-**Fix direction:** release inside the `disposed` branch
-(`if (disposed) { await releaseShortcut(full); return }`), or hold a token so a
-stale bind undoes itself.
+**Fix:** the proposed one-liner (release inside the `disposed` branch) was
+already in the tree and is **not** sufficient on its own, because it is still a
+check-then-act: the stale run releases whatever `isRegistered` reports, with no
+ordering against the *newest* effect's bind. In the reverse race it therefore
+unregisters a live accelerator — change the shortcut away and back quickly and
+the second run's registration is torn down by the first run's late release, so
+the capture keys silently stop working while settings still show them bound.
+
+So the ordering is fixed where the round trips are, not at the call site:
+`bindShortcut` and `releaseShortcut` in `shortcuts.ts` now run through
+`serialized()`, a per-accelerator promise chain. Every bind and release for one
+accelerator is FIFO, so
+
+- cleanup's release is queued *behind* the bind it was racing with, and undoes
+  it — which is what actually kills the leak, with no `disposed` branch needed;
+- a stale run can no longer release an accelerator a newer run owns, because
+  the newer run's bind is queued between its own start and any later release;
+- the `isRegistered` guard inside a bind now sees the state left by the previous
+  operation, so re-binding an accelerator that was just released stops reporting
+the false "already used by another app".
+
+The two manual releases in `capture.tsx`'s `disposed` branches were removed
+rather than kept — with the chain in place they are the late release described
+above. `disposed` remains, but only to suppress an error from a superseded run.
+
+Verified: `bun run typecheck` and `bun run lint` clean. No automated cover — the
+race needs the Tauri global-shortcut plugin, which the frontend has no test
+harness for; the manual check is editing a shortcut twice while the first bind
+is in flight and confirming the old accelerator no longer fires.
 
 ### M3. Region overlay loses the drag if the pointer is released outside the window — **Fixed**
 
@@ -959,6 +985,14 @@ Covered by `ocr::tests::a_wedged_process_is_killed_rather_than_waited_on` (a
 the happy path. Also verified end-to-end against the real tesseract 5.5.0 on
 `~/Pictures/mx.png`: 0.75s, 6 words with correct coordinates, so the piped
 `wait_with_output` path does not silently lose stdout.
+
+**Superseded when OCR moved to Indra OCR** (tesseract 5.5 -> indra-ocr 1.1.2).
+Both halves still stand, in a new shape: the timeout is now a *batch* timeout
+(`XREENSHOTY_OCR_TIMEOUT_SECS`, default 300s) around a subprocess that reads
+the whole batch, and a failed row is still stamped attempted. What is new is
+the split between a *batch-level* failure and a *per-file* failure, and the
+gate in `db::pending` — see "A broken OCR must not be offered as work" in
+AGENTS.md. The old POSIX-spawning tests are gone with tesseract.
 
 ### BM10. Resume-from-pause can take up to 20 seconds — **Fixed**
 

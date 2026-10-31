@@ -441,6 +441,15 @@ pub fn to_f32_bytes(vector: &[f32]) -> Vec<u8> {
     bytes
 }
 
+/// Inverse of `to_f32_bytes`: decodes a vec0 blob back into floats.
+/// Trailing partial chunks are ignored (defensive; vec0 writes aligned).
+pub fn from_f32_bytes(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 fn dir_config_log() -> std::path::PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)

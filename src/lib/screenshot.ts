@@ -194,6 +194,92 @@ export function indexPause(paused: boolean) {
   return trackedInvoke<void>("index_pause", { paused })
 }
 
+/** Push the face-indexing opt-in to Rust. Off by default (Milestone 7). */
+export function setFaceIndexing(enabled: boolean) {
+  return trackedInvoke<void>("set_face_indexing", { enabled })
+}
+
+export interface FaceStatus {
+  venv_ready: boolean
+  models_present: boolean
+  face_count: number
+  /** Faces that landed in a cluster; the rest were seen once or too small. */
+  clustered_faces: number
+  cluster_count: number
+  /** Screenshots whose face pass has finished, and how many exist. */
+  screenshots_indexed: number
+  screenshots_total: number
+}
+
+/** face-env + models + indexed face count, for the Settings readout. */
+export function faceStatus() {
+  return trackedInvoke<FaceStatus>("face_status")
+}
+
+export interface OcrStatus {
+  /** The engine that reads new screenshots. */
+  engine: string
+  /** The ocr-env interpreter and the bundled script. */
+  venv_ready: boolean
+  /** The Indra OCR model files. */
+  models_present: boolean
+}
+
+/** OCR readiness, for the Settings readout. */
+export function ocrStatus() {
+  return trackedInvoke<OcrStatus>("ocr_status")
+}
+
+/** One grouped person. `label` is the user's name (null = "Person N"). */
+export interface FaceCluster {
+  cluster_id: number
+  label: string | null
+  representative_face_id: number
+  face_count: number
+  screenshot_ids: number[]
+}
+
+/** All people clusters, largest first. */
+export function faceClusters() {
+  return trackedInvoke<FaceCluster[]>("face_clusters")
+}
+
+/** Re-run clustering at the current eps. Returns faces assigned. */
+export function reclusterFaces() {
+  return trackedInvoke<number>("recluster_faces")
+}
+
+/** Name a cluster; `null`/blank clears it. */
+export function renameCluster(clusterId: number, label: string | null) {
+  return trackedInvoke<void>("rename_cluster", { clusterId, label })
+}
+
+/** Merge `from` into `into`. Durable across reclusters. Returns faces moved. */
+export function mergeClusters(from: number, into: number) {
+  return trackedInvoke<number>("merge_clusters", { from, into })
+}
+
+/** Forget a person: their faces leave the index, their screenshots stay.
+ *  Returns how many faces were removed. */
+export function forgetCluster(clusterId: number) {
+  return trackedInvoke<number>("forget_cluster", { clusterId })
+}
+
+/** One person's screenshots, newest first. */
+export function clusterScreenshots(clusterId: number) {
+  return trackedInvoke<Screenshot[]>("cluster_screenshots", { clusterId })
+}
+
+/** 7.6: screenshots whose faces are closest to a reference face. */
+export function searchByFace(faceId: number, limit = 60) {
+  return trackedInvoke<SearchHit[]>("search_by_face", { faceId, limit })
+}
+
+/** Cropped face tile as a data URL, for the People grid. */
+export function getFaceThumbnail(faceId: number, size = 160) {
+  return trackedInvoke<string>("face_thumbnail", { faceId, size })
+}
+
 export function screenshotCount() {
   return trackedInvoke<number>("screenshot_count")
 }

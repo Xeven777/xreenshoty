@@ -4,8 +4,9 @@
 Local-first screenshot capture and later retrieval, fully offline. Match XFCE
 Screenshot behaviour for capture first; only then add local models for search.
 
-Status: Milestones 1–4, 5.0-5.6 and 6.1-6.3 implemented. Remaining:
-6.4 answer synthesis, 6.5 rerank if needed, 7.x face grouping.
+Status: Milestones 1–4, 5.0-5.6, 6.1-6.3 and 7.0-7.6 (opt-in face indexing,
+People view, search-by-person) implemented. Remaining: 6.4 answer synthesis,
+6.5 rerank if needed.
 
 ## Stack
 
@@ -16,7 +17,7 @@ Status: Milestones 1–4, 5.0-5.6 and 6.1-6.3 implemented. Remaining:
 | Files | `~/Pictures` | Source of truth, never the DB |
 | Metadata | SQLite via `rusqlite` (bundled) | `~/.local/share/xreenshoty/screenshots.db` |
 | Keyword search | SQLite FTS5 | Built into bundled SQLite |
-| OCR | **tesseract 5.5.0** (already installed) | See M5 decisions |
+| OCR | **Indra OCR 1.1.2** (ONNX, CPU) | Replaces tesseract; see M5 decisions |
 | Embeddings | **EmbeddingGemma 2**, image → 768-d | Served by llama.cpp, Vulkan backend |
 | Vector store | **sqlite-vec** (`vec0` virtual table) | Replaces LanceDB |
 | Speech-to-text | **Whistle** 16.9 MB via `cactus-needle` | Replaces Phonon-2 |
@@ -26,7 +27,7 @@ All inference is local. Nothing leaves the machine.
 
 ### Python: isolated, not required
 
-The Rust app talks plain HTTP to two localhost servers and shells out to two
+The Rust app talks plain HTTP to two localhost servers and shells out to three
 venv pythons. No Python runs in the webview or on the capture path; each is a
 separate process that owns its own environment:
 
@@ -34,7 +35,7 @@ separate process that owns its own environment:
 |---|---|---|
 | Embeddings | `llama-server` (native binary, Vulkan) over HTTP | No |
 | Answer model | Ollama (Go binary) over HTTP | No |
-| OCR | `tesseract` (C++) | No |
+| OCR | `indra_ocr` (ONNX Runtime) | **Yes — isolated** |
 | Vector search | sqlite-vec, statically linked into our Rust binary | No |
 | Voice (M6) | `cactus-needle` / Whistle | **Yes — isolated** |
 | Faces (M7) | `onnxruntime` + 2 ONNX files | **Yes — isolated** |
@@ -62,16 +63,43 @@ verification items are tracked in Milestone 5's "carry-over" list.
 
 ### Decisions taken (researched, not assumed)
 
-**OCR: tesseract, not Xiaomi-OCR-0.** Xiaomi-OCR-0 is real (`SeerRay-Lab`, 0.8B,
-Qwen3.5-based) but its published benchmarks are OmniDocBench / DocVQA / InfoVQA —
-scanned, warped and photographed **documents**. Two problems on this machine:
+**OCR: Indra OCR, not tesseract and not Xiaomi-OCR-0.** Xiaomi-OCR-0 is real
+(`SeerRay-Lab`, 0.8B, Qwen3.5-based) but its published benchmarks are
+OmniDocBench / DocVQA / InfoVQA — scanned, warped and photographed
+**documents**. Two problems on this machine:
 1. It only runs behind an SGLang or vLLM **server process with a GPU**. There is
    no GPU here (Intel UHD iGPU), and it would add a Python runtime to a Rust app.
 2. It is document-tuned, not UI-screenshot-tuned.
 
-tesseract 5.5.0 is already installed (`eng` + `osd`), is CPU-only, starts in
-milliseconds, and handles UI text fine. Revisit Xiaomi-OCR-0 only if search
-quality on real screenshots is demonstrably weak.
+tesseract 5.5.0 was the first choice here and worked, but it was English-only
+(`eng` + `osd`, so R5 was real), it read UI text *wrong* (it turned
+"GO TO ASSESSMENT" into "GO TO ASSESSME!"), and it produced flat word soup
+with no line structure.
+
+**Indra OCR** (Datalab, Apache 2.0 code, modified OpenRAIL-M weights) is a 1M
+parameter model that runs on CPU through ONNX Runtime — no PyTorch, no GPU,
+no server. It reads 80+ languages, keeps the line structure, and hands back a
+box and a confidence for every line. Measured on this box against the real
+corpus:
+
+| | tesseract 5.5 (4 workers) | Indra OCR (4 workers) |
+|---|---|---|
+| Throughput | 0.50 s/image | **0.136 s/image** (7.35 img/s) |
+| Unique words over 34 screenshots | 1604 | **2149** |
+| Line structure | none (flat) | kept |
+| Languages | `eng` only | 80+ |
+
+The cost is a Python venv (`ocr-env`) and 73 MB of model files under
+`~/apps/models/indra-ocr`, both installed by `scripts/setup-ocr.sh`. That is
+the same shape as the face and voice stacks: isolated, offline, and degrading
+to "no text" when it is not installed.
+
+**Threads, not processes, was the wrong first guess.** Indra's own docs say
+one page at a time with 4 ORT threads, but on this hybrid P/E-core CPU more
+threads make a page *slower* (threads=1: 267 ms/image, threads=8: 986 ms/image).
+One single-threaded worker process per core wins: `convert_many` does exactly
+that, and 4 workers measured 7.35 img/s against 1.96 img/s for a single
+4-thread process.
 
 **Vectors: sqlite-vec, not LanceDB.** 768 dims × 4 bytes = 3 KB per screenshot;
 369 images ≈ 1.1 MB. LanceDB would mean a second storage engine, a second on-disk
@@ -147,8 +175,11 @@ also use the GPU once the Arc card is visible.
 - **R4 (resolved): Mesa version is fine.** An earlier draft warned that Arc
   needs Mesa ≥26.1 for `VK_KHR_cooperative_matrix`. Checked on the actual card:
   it is supported on Mesa 25.0.7, so no PPA or driver upgrade is needed.
-- **R5: tesseract is English-only here.** Extra languages need
-  `tesseract-ocr-<lang>` packages.
+- **R5 (resolved): OCR language coverage.** tesseract was English-only here
+  (`eng` + `osd`); extra languages needed `tesseract-ocr-<lang>` packages.
+  Indra OCR reads 80+ languages out of the box — Latin, Cyrillic, Greek, CJK,
+  RTL and the Indic scripts — with no extra packages and no per-language
+  config.
 
 ### Spike 5.0 findings (the facts, so nobody re-derives them)
 
@@ -232,14 +263,19 @@ a background task without hurting the machine.
       disables search rather than blocking capture, because the PNGs on disk are
       the source of truth. Covered by `search_schema_is_complete_and_live`.
 - [x] 5.2 Async indexer (`src-tauri/src/indexer.rs`). Background task reads
-      rows where `ocr_text` is empty or `embedded_at` is NULL, runs tesseract and
+      rows where `ocr_boxes` is NULL or `embedded_at` is NULL, runs Indra OCR and
       the embedding server, and writes results. Never on the capture path —
       `save_png` records the row and calls `indexer::poke()`, which only wakes
       the worker. Verified end to end on a real screenshot: OCR extracted 299
       words, embedding returned 768 dims, FTS matched the stored text and vec0
       returned the right row.
-- [x] 5.3 OCR (`src-tauri/src/ocr.rs`). tesseract TSV output, which yields word
-      boxes and confidences for free; only level-5 rows are real words.
+- [x] 5.3 OCR (`src-tauri/src/ocr.rs`). **Swapped from tesseract to Indra OCR**
+      (1.1.2): a `ocr-env` venv python runs `scripts/ocr/ocr_batch.py` over the
+      whole batch, JSON over stdin/stdout, the models loaded once per batch.
+      Indra boxes *lines*, not words, and its per-character positions live in
+      internals that are not public API — so a line's width is divided between
+      its words by character count. Real word order and a real word count;
+      the boxes are a proportional guess and must never be drawn.
 - [x] 5.4 Embeddings (`src-tauri/src/embedder.rs`). The app now **spawns
       llama-server itself**, waits for `/health`, and posts to the native
       `/embedding`. If the server is unavailable the row is stamped `skipped`
@@ -483,37 +519,67 @@ deletable per cluster.
 Measurements, in order. If 7.0 fails, stop and report rather than building on it.
 
 1. `onnxruntime` install size, venv size, cold boot time, RSS. Target < 200 MB.
-2. Model sizes actually on disk: `face_detection_yunet_2026may.onnx` plus one
-   recognizer. Target < 15 MB combined.
-3. **Census over the ~370 existing screenshots: how many contain at least one
-   face >= 80 px, and what is the face-size distribution?** This is the R1 gate
-   and the go/no-go on the whole milestone.
-4. Latency per image, CPU only, over that census.
-5. Cosine separation: same-person aligned pairs vs different-person pairs, one
-   histogram each. The `eps` actually chosen goes into this document with the
-   numbers behind it — not before.
-6. EdgeFace ONNX export verified against the `.pt` output on the same crop.
+   DONE 7.0a: venv `face-env` (onnxruntime 1.31.0, numpy, pillow,
+   opencv-python-headless) works; same-person cosine 0.9979 on the two
+   `anish*.png` portraits.
+2. Model sizes actually on disk: `face_detection_yunet_2023mar.onnx` (233 KB)
+   plus `face_recognition_sface_2021dec.onnx` (**38.7 MB** — SFace is bigger
+   than the ~2 MB estimate; combined ~39 MB, so the "<15 MB" target is
+   superseded. Disk, not the gate; runtime RSS is).
+   NOTE: the plan said 2026may, but its dynamic-shape export fails in raw
+   onnxruntime (`Add_44` broadcast 36-vs-37 on non-stride-32 inputs) and emits
+   raw anchors, not `[N, 15]` rows. The implementation uses **2023mar**
+   (fixed 640x640) through `cv2.FaceDetectorYN`, which owns the anchor math.
+3. **Census: 40/397 images (10%) have >=1 face >= 80 px; 63 faces total.**
+   The high cross-image cosine (median 0.848) is explained, not alarming: one
+   bearded man repeats across ~15 meeting screenshots, so most pairs are not
+   strangers. R1 gate: thin but real — proceed, sized as an experiment.
+4. Latency: **~0.06 s/image CPU** (23.9 s wall for 397 images), ~0.22 s for a
+   2-image batch including interpreter boot.
+5. Cosine separation: same-image pairs median 0.897 (n=55, all > 0.4);
+   cross-image median 0.848 (n=1898). No clean gap — `eps` for 7.4 still
+   needs labelled pairs, not these auto-stats.
+6. DROPPED: EdgeFace is out. Decision 2026-10-16: ship YuNet + SFace instead
+   (both OpenCV zoo, both Apache-2.0, both download-and-run, no export step).
 
 ### Work slices
 
-- [ ] **7.0 Spike** — the measurements above. Gates everything below it.
-- [ ] **7.1 Schema.** Idempotent, per the existing `add_column` PRAGMA rule. A
-      separate `face_vec` `vec0` table with **`distance_metric=cosine` stated
-      explicitly** (the default is L2, which is not a similarity), plus a cluster
-      table holding face ids and a user-given name. On any model change the face
-      rows must be droppable and rebuildable from the PNGs, never migrated.
-- [ ] **7.2 `face.rs`** — shells out to `face-env` python, mirroring `voice.rs`
-      (venv discovery, JSON over stdout, graceful missing-venv error). Expose
-      `min_face_px` as an env override so the R1 gate can be tuned without a
-      rebuild.
-- [ ] **7.3 Stage wiring in `indexer.rs`** — after the embedding stage, inside
-      the same batch, never blocking capture. Record the model name next to every
-      vector so the number has provenance.
-- [ ] **7.4 Clustering** — `eps` from the 7.0 numbers, with the 80 px gate.
-- [ ] **7.5 People view** — cluster list with a representative tile per cluster,
-      click-through to screenshots, rename and merge controls.
-- [ ] **7.6 "find me with <person>"** — KNN on `face_vec` seeded from one
-      reference face. Only build it if 7.0 says there is enough signal.
+- [x] **7.0 Spike** — done 2026-10-16, YuNet + SFace (see numbered findings).
+- [x] **7.1 Schema.** `faces` + `face_vec` (128-d, cosine), stamp columns,
+      prune cascade. Done 2026-10-16.
+- [x] **7.2 `face.rs`** — `face-env` subprocess, JSON stdin/stdout, 80 px gate
+      on both sides, `face_status` probe. Done 2026-10-16.
+- [x] **7.3 Stage wiring in `indexer.rs`** — after embeddings, opt-in
+      `FACE_INDEXING` flag, rows stamped attempted on success only. Plus the
+      Settings toggle + readiness readout. Done 2026-10-16.
+- [x] **7.4 Clustering** — DONE 2026-10-18: average-linkage agglomerative in
+      new `cluster.rs` (`DEFAULT_EPS=0.55`, override via
+      `XREENSHOTY_FACE_CLUSTER_EPS`), `faces.cluster_id` + idempotent schema,
+      `db::recluster_faces` + `db::face_clusters`, indexer reclusters once per
+      face batch, `recluster_faces`/`face_clusters` commands registered.
+      Calibration: eps 0.5 → 13 clusters / 43 faces / 26 singletons on 69
+      faces; reference identity stable 0.4→0.52, over-merges at 0.6. Raised to
+      0.55 on 2026-11-01 once the corpus reached 375 faces: 50 clusters / 280
+      clustered faces / 95 singletons, against 54 / 267 / 108 at 0.5 — a modest
+      pull on the singleton tail, no collapse. Trap
+      fixed en route: SFace ONNX expects raw 0-255 BGR (double-normalising
+      collapsed everything to median cosine 0.857; AGENTS.md).
+- [x] **7.5 People view** — DONE 2026-10-18: People tab (`components/people.tsx`)
+      with a cropped face tile per cluster (representative = largest face),
+      click-through to that person's screenshots, inline rename, and merge into
+      another person. Backend: `face_clusters` + `face_links` identity tables,
+      `db::rename_cluster` / `merge_clusters` / `cluster_screenshots` /
+      `face_box`, `face_thumbnail` crop command, `face_clusters` now returns
+      label + representative + counts. Cluster ids are made **stable across
+      reclusters** by overlapping onto the previous assignment, and a user merge
+      is stored as a same-person link replayed through union-find every
+      recluster — otherwise a rename would detach on the next batch and a merge
+      would silently revert.
+- [x] **7.6 "find me with <person>"** — DONE 2026-10-18: `db::search_by_face`
+      KNN on `face_vec` seeded from a reference face, screenshot rows deduped
+      (best face per shot), cosine scored + z-standardised; surfaced as
+      "Find similar" in the People view. Built because 7.0 showed real signal
+      (reference identity stable 0.4–0.52).
 
 ---
 
@@ -537,9 +603,15 @@ Measurements, in order. If 7.0 fails, stop and report rather than building on it
   iGPU plus llvmpipe. Enable it in BIOS, then re-check `vulkaninfo --summary`.
 - 12 cores, 7.6 GB RAM but only ~2.0 GB available, 6 GB swap + 7.5 GB zram.
   Mesa 25.0.7 (cooperative matrix needs ≥26.1). No CUDA.
-- Installed and usable: `tesseract 5.5.0` (eng, osd), `ollama 0.34.0`, `uv`,
-  `python3`, `curl`, `gcc`, `vulkaninfo`/`vainfo`/`intel_gpu_top`. Not installed:
-  `llama-server`, `llama.cpp`, `intel-opencl-icd`.
+- Installed and usable: `ollama 0.34.0`, `uv`, `python3`, `curl`, `gcc`,
+  `vulkaninfo`/`vainfo`/`intel_gpu_top`. Not installed: `llama-server`,
+  `llama.cpp`, `intel-opencl-icd`.
+- OCR is installed by `scripts/setup-ocr.sh`: it creates
+  `~/.local/share/xreenshoty/ocr-env` (`indra-ocr` 1.1.2) and downloads 73 MB of
+  models into `~/apps/models/indra-ocr`. The app never downloads anything
+  itself — it runs with `INDRA_OCR_MODEL_DIR` pointed at that folder and
+  `HF_HUB_OFFLINE=1`.
+- `tesseract 5.5.0` is still on the box but the app no longer calls it.
 - `xcap` (successor to `screenshots`) needs `libpipewire-0.3-dev`, uninstallable
   here (runtime 1.4.10 vs repo dev 1.4.5). Stay on `screenshots` until MX syncs.
 - `tauri = { version = "2" }` **must** stay in `[dependencies]`. Without it there is

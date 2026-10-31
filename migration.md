@@ -30,7 +30,8 @@ blocked on a fact nobody has checked yet.
 | Pointer → correct monitor | ✅ tested | ❌ always monitor 0 | ❌ always monitor 0 |
 | Save folder / DB / logs | ✅ | ✅ portable already | ✅ portable already |
 | Global shortcuts | ✅ | 🟡 works, wrong convention | 🟡 works, wrong convention |
-| OCR | ✅ tesseract on PATH | 🟡 same code, needs tesseract | 🟡 same code, needs tesseract |
+| OCR | ✅ Indra OCR, 4 workers | 🟡 same code, needs the venv + models | 🟡 same code, needs the venv + models |
+| Face indexing (People) | ✅ opt-in, ONNX on CPU | 🟡 same code, needs the venv + 2 ONNX files | 🟡 same code, needs the venv + 2 ONNX files |
 | Image embeddings | ✅ Arc on Vulkan | ❌ hardcoded Linux path | ❌ hardcoded + no Metal path |
 | Voice input | ✅ pw-record | ❌ no binary exists | ❌ no binary exists |
 | Search / DB / indexer | ✅ | ✅ pure Rust + SQLite | ✅ pure Rust + SQLite |
@@ -264,13 +265,18 @@ llama.cpp's release assets do cover both platforms (confirmed): macOS Apple
 Silicon arm64 and macOS Intel x64, plus Windows x64 CPU, CUDA 12, CUDA 13,
 Vulkan, SYCL and HIP.
 
-### T2.3 tesseract is a bare PATH lookup
+### T2.3 the OCR runtime is a Python venv plus model files
 
-`ocr.rs:80` does `Command::new("tesseract")`. The code is portable as-is; the
-question is packaging. Either document the install (`brew install tesseract`,
-UB Mannheim's Windows installer) or ship it as a Tauri sidecar via
-`bundle.resources`. Note the timeout wrapper (`ocr.rs:45-71`) and its unit
-tests are portable, but see T3.2.
+OCR is Indra OCR 1.1.2, which runs on ONNX Runtime. `ocr.rs` shells out to
+`~/.local/share/xreenshoty/ocr-env/bin/python` (overridable with
+`XREENSHOTY_OCR_PYTHON`) and the models live in `~/apps/models/indra-ocr`
+(`XREENSHOTY_OCR_MODELS`). The code is portable as-is; the question is
+packaging. `scripts/setup-ocr.sh` is the Linux answer and needs `uv`; for
+macOS and Windows the same three steps apply (create a venv, `pip install
+indra-ocr`, download the model files from the `datalab-to/indra-ocr` repo at
+revision `v1.1.0`). The script itself is bundled via `bundle.resources`, so
+only the interpreter and the models have to be installed. The face and voice
+stacks have the same shape, so one installer could cover all three.
 
 ### T2.4 Bundle targets and code signing
 
@@ -301,13 +307,17 @@ registers the plugin under `#[cfg(desktop)]`, which correctly covers both.
 
 ### T3.2 Tests that assume POSIX binaries
 
-Two `ocr.rs` tests spawn `sleep` and `echo`
-(`ocr.rs:169`, `ocr.rs:187`), which do not exist on Windows — CI would fail for
-reasons unrelated to the code. Windows has `timeout` instead of `sleep`. Either
-gate them with `#[cfg(unix)]` or make the binary name per-platform. The tests
-themselves are valuable (they guard the "a wedged process is killed rather than
-waited on" behaviour, which is a real bug class) — keep the intent, port the
-fixture.
+The old `ocr.rs` timeout tests spawned `sleep` and `echo`, which do not exist
+on Windows. They are gone with tesseract: the new `ocr.rs` tests are pure
+functions (the word split, the batch JSON parse) plus one `#[ignore]`d
+end-to-end test that needs the venv. The face suite still has the same
+problem, so the `#[cfg(unix)]` gate is still worth adding there.
+
+Two Windows-specific things the OCR swap introduces: the venv layout is
+`Scripts\python.exe` rather than `bin/python` (the voice stack already has
+this problem), and `convert_many` spawns workers with the `spawn` start
+method, so the script must stay behind an `if __name__ == "__main__":` guard
+or every worker re-runs the whole batch.
 
 ---
 
@@ -369,7 +379,7 @@ Do (A) now, fold into (C) once pipewire-dev lands.
 - [ ] Decide Vulkan vs CUDA. If CUDA, bundle the runtime DLLs.
 - [ ] Replace the voice recorder with `cpal`; fix the venv path to
       `Scripts\python.exe`.
-- [ ] Ship or document tesseract.
+- [ ] Ship or document the OCR runtime (venv + `indra-ocr` models).
 - [ ] Add `msi`/`nsis` bundle targets.
 - [ ] `#[cfg(unix)]`-gate the two POSIX-shell tests (`T3.2`).
 - [ ] Default shortcuts to Ctrl-based (already correct), fix `prettyAccelerator`.
@@ -444,7 +454,7 @@ read in this codebase or confirmed from a primary source; these were not.
       (> 2026-10-06).
 - [ ] Replace the voice recorder with `cpal`; add **microphone** permission as a
       second, separate grant.
-- [ ] Ship or document tesseract.
+- [ ] Ship or document the OCR runtime (venv + `indra-ocr` models).
 - [ ] Add `dmg`/`app` targets, plus signing and notarization.
 - [ ] Decide universal binary vs single-arch.
 - [ ] Shortcut defaults to ⌘; render `⌘ ⌥ ⇧ ⌃`.

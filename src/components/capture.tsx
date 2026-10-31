@@ -333,26 +333,18 @@ export function Capture({
       const fullError = await bindShortcut(full, () =>
         actionsRef.current.fullscreen?.()
       )
-      // The cleanup may have run `releaseShortcut` while this bind was still in
-      // flight, in which case cleanup found nothing registered and did nothing.
-      // The accelerator now exists but nobody will ever release it, so release
-      // it here before bailing (M2).
-      if (disposed) {
-        void releaseShortcut(full)
-        return
-      }
+      if (disposed) return
       const winError =
         win && win !== full
           ? await bindShortcut(win, () => actionsRef.current.window?.())
           : null
-      if (disposed) {
-        void releaseShortcut(full)
-        if (win && win !== full) void releaseShortcut(win)
-        return
-      }
+      if (disposed) return
       onShortcutError(fullError ?? winError)
     })()
 
+    // Releases queue behind this run's in-flight binds (shortcuts.ts serialises
+    // per accelerator), so a teardown mid-bind still undoes what it registered
+    // without touching whatever the next run owns (M2).
     return () => {
       disposed = true
       void releaseShortcut(full)

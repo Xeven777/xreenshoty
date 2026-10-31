@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 /// One indexed screenshot. The PNG on disk stays the source of truth; this is
@@ -73,7 +73,11 @@ impl SearchHit {
             height: height as u32,
             source,
             snippet: None,
-            score: Some(l2_to_cosine(distance) as f32),
+            // Both vec0 tables are declared `distance_metric=cosine`, so
+            // `distance` is already `1 - cos`: similarity is `1 - distance`.
+            // (Verified on this box: orthogonal unit vectors return 1.0.)
+            // `l2_to_cosine` is kept only to read legacy L2 tables.
+            score: Some((1.0 - distance) as f32),
             score_z: None,
         }
     }
@@ -146,6 +150,135 @@ fn add_column(conn: &Connection, column: &str, decl: &str) -> Result<(), String>
         "ALTER TABLE screenshots ADD COLUMN {column} {decl}"
     ))
     .map_err(|e| format!("Add column {column} failed: {e}"))
+}
+
+/// Face tables: one row per detected face, plus `vec0` over the SFace vectors.
+///
+/// A face belongs to exactly one screenshot (`screenshot_id`), so deleting the
+/// screenshot deletes its faces. The embedding space is SFace's, not
+/// EmbeddingGemma's — separate table, separate dimension, separate label, same
+/// `distance_metric=cosine` rule as `screenshot_vec`.
+///
+/// Best-effort like the rest of the search schema: a broken extension degrades
+/// the face feature, it never blocks capture.
+///
+/// The order below is load-bearing for upgrades. A database created before 7.4
+/// already has a `faces` table with no `cluster_id`, so `CREATE TABLE IF NOT
+/// EXISTS` is a no-op and any statement referencing the column fails. Putting
+/// the index in the same batch as the table made that failure abort the whole
+/// function — including the `ALTER` that adds the column — so face indexing
+/// announced itself "disabled" forever on exactly the installs that needed the
+/// migration. Add the column first, then index it.
+fn ensure_face_schema(conn: &Connection) {
+    if let Err(e) = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS faces (
+             id            INTEGER PRIMARY KEY AUTOINCREMENT,
+             screenshot_id INTEGER NOT NULL REFERENCES screenshots(id) ON DELETE CASCADE,
+             box_x         REAL    NOT NULL,
+             box_y         REAL    NOT NULL,
+             box_w         REAL    NOT NULL,
+             box_h         REAL    NOT NULL,
+             score         REAL    NOT NULL,
+             cluster_id    INTEGER
+         );",
+    ) {
+        log::warn!("face table unavailable, face indexing disabled: {e}");
+        return;
+    }
+    // Idempotent: existing installs predate `cluster_id`.
+    if let Err(e) = conn.execute("ALTER TABLE faces ADD COLUMN cluster_id INTEGER", []) {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            log::warn!("faces.cluster_id unavailable: {e}");
+        }
+    }
+
+    if let Err(e) = conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_faces_screenshot ON faces (screenshot_id);
+         CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces (cluster_id);",
+    ) {
+        log::warn!("face indexes unavailable: {e}");
+        return;
+    }
+
+    if let Err(e) = conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS face_vec USING vec0(embedding float[{}] distance_metric=cosine);",
+        crate::face::FACE_DIM
+    )) {
+        log::warn!("face vec0 unavailable, face indexing disabled: {e}");
+        return;
+    }
+    purge_orphan_face_vectors(conn);
+}
+
+/// vec0 has no cascade and no UPSERT, so every path that drops a face deletes
+/// its vector explicitly. One helper so a new path cannot forget.
+fn delete_face_vector(conn: &Connection, face_id: i64) -> rusqlite::Result<usize> {
+    conn.execute("DELETE FROM face_vec WHERE rowid = ?1", params![face_id])
+}
+
+/// Deletes vectors whose face row is gone.
+///
+/// `faces.id` is *reused* on every install whose table predates
+/// `AUTOINCREMENT`, so a vector left behind by a face deleted without it sits
+/// on a rowid the next detected face will take. vec0 has no UPSERT, so that
+/// INSERT fails on the primary key and `set_faces` never stamps the screenshot.
+/// `set_faces` deletes before inserting too, so this repairs the rows already
+/// stranded rather than being the only guard.
+fn purge_orphan_face_vectors(conn: &Connection) {
+    let read = |sql: &str| -> Vec<i64> {
+        let Ok(mut stmt) = conn.prepare(sql) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([], |r| r.get::<_, i64>(0)) else {
+            return Vec::new();
+        };
+        rows.filter_map(Result::ok).collect()
+    };
+
+    let faces: std::collections::HashSet<i64> = read("SELECT id FROM faces").into_iter().collect();
+    let orphans: Vec<i64> = read("SELECT rowid FROM face_vec")
+        .into_iter()
+        .filter(|id| !faces.contains(id))
+        .collect();
+
+    let mut removed = 0;
+    for id in &orphans {
+        if delete_face_vector(conn, *id).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        log::info!("face index: removed {removed} orphaned face vector(s)");
+    }
+}
+
+/// Cluster identity tables (M7.5).
+///
+/// `faces.cluster_id` is only the *current* assignment, recomputed on every
+/// recluster. Names and the user's merges must outlive that recomputation, so
+/// they live here instead of on the assignment:
+///   - `face_clusters` holds a user-given name per stable cluster id.
+///   - `face_links` records "these two faces are the same person", written by
+///     the merge action and re-applied as a union-find constraint on every
+///     recluster, so a merge cannot be silently undone by the next batch.
+///
+/// Best-effort like the rest of the search schema: a failure degrades the
+/// People view, it never blocks capture.
+fn ensure_cluster_schema(conn: &Connection) {
+    if let Err(e) = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS face_clusters (
+             id    INTEGER PRIMARY KEY,
+             label TEXT
+         );
+         CREATE TABLE IF NOT EXISTS face_links (
+             a INTEGER NOT NULL,
+             b INTEGER NOT NULL,
+             PRIMARY KEY (a, b)
+         );",
+    ) {
+        log::warn!("face cluster tables unavailable, People view disabled: {e}");
+    }
 }
 
 /// Search tables: FTS5 over OCR text, and `vec0` over embeddings.
@@ -236,10 +369,20 @@ fn open(path: &Path) -> Result<Connection, String> {
         // is handed back on every idle poll forever (BM4).
         ("embed_attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("embed_retry_at", "INTEGER"),
+        // Face pass bookkeeping. Unlike OCR/embeddings there is no failure
+        // backoff: a batch-level failure (missing venv, missing models) is an
+        // environment problem, not a row problem, so rows are stamped attempted
+        // and only re-offered when the model label changes. Per-row failures
+        // (undecodable file) are logged and stamped the same way.
+        ("face_indexed_at", "INTEGER"),
+        ("face_model", "TEXT"),
+        ("face_count", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         add_column(&conn, column, decl)?;
     }
 
+    ensure_face_schema(&conn);
+    ensure_cluster_schema(&conn);
     ensure_search_schema(&conn);
     Ok(conn)
 }
@@ -385,6 +528,26 @@ pub fn prune_missing() -> Result<usize, String> {
         for id in &gone {
             tx.execute("DELETE FROM screenshot_vec WHERE rowid = ?1", params![id])
                 .map_err(|e| format!("Vector delete failed: {e}"))?;
+            // Faces cascade two ways: explicit vec delete (vec0 has no
+            // triggers), then the rows. `ON DELETE CASCADE` is declared but
+            // not relied on — SQLite needs `PRAGMA foreign_keys` for that.
+            let fids: Vec<i64> = {
+                let mut stmt = tx
+                    .prepare("SELECT id FROM faces WHERE screenshot_id = ?1")
+                    .map_err(|e| format!("Face read failed: {e}"))?;
+                let ids = stmt
+                    .query_map(params![id], |r| r.get(0))
+                    .map_err(|e| format!("Face read failed: {e}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Face read failed: {e}"))?;
+                ids
+            };
+            for fid in &fids {
+                delete_face_vector(&tx, *fid)
+                    .map_err(|e| format!("Face vector delete failed: {e}"))?;
+            }
+            tx.execute("DELETE FROM faces WHERE screenshot_id = ?1", params![id])
+                .map_err(|e| format!("Face delete failed: {e}"))?;
             tx.execute("DELETE FROM screenshots WHERE id = ?1", params![id])
                 .map_err(|e| format!("Row delete failed: {e}"))?;
         }
@@ -485,6 +648,17 @@ fn import_existing_blocking(dir: Option<String>) -> Result<usize, String> {
     Ok(imported)
 }
 
+/// The five columns every screenshot query selects, in this order.
+fn screenshot_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Screenshot> {
+    Ok(Screenshot {
+        path: row.get(0)?,
+        created_at: row.get(1)?,
+        width: row.get::<_, i64>(2)? as u32,
+        height: row.get::<_, i64>(3)? as u32,
+        source: row.get(4)?,
+    })
+}
+
 #[tauri::command]
 pub async fn list_recent(limit: Option<u32>) -> Result<Vec<Screenshot>, String> {
     let limit = limit.unwrap_or(60).clamp(1, 500) as i64;
@@ -497,15 +671,7 @@ pub async fn list_recent(limit: Option<u32>) -> Result<Vec<Screenshot>, String> 
             .map_err(|e| format!("Prepare failed: {e}"))?;
 
         let rows = stmt
-            .query_map(params![limit], |row| {
-                Ok(Screenshot {
-                    path: row.get(0)?,
-                    created_at: row.get(1)?,
-                    width: row.get::<_, i64>(2)? as u32,
-                    height: row.get::<_, i64>(3)? as u32,
-                    source: row.get(4)?,
-                })
-            })
+            .query_map(params![limit], screenshot_row)
             .map_err(|e| format!("Query failed: {e}"))?;
 
         rows.collect::<Result<Vec<_>, _>>()
@@ -631,6 +797,94 @@ mod search_schema_tests {
             )).ok();
         }
     }
+
+    /// A database created before 7.4 has a `faces` table with no
+    /// `cluster_id`. Opening it must add the column *and* build the indexes
+    /// that reference it — indexing first aborted the whole function, so the
+    /// column was never added and face indexing stayed "disabled" on exactly
+    /// the installs that needed the migration.
+    #[test]
+    fn a_pre_74_faces_table_is_migrated_on_open() {
+        let _guard = super::test_lock();
+        let db = test_db("xreenshoty-faces-migration.db");
+
+        // Stand up the old shape directly, before anything opens it.
+        {
+            let old = Connection::open(&db).unwrap();
+            old.execute_batch(
+                "CREATE TABLE screenshots (
+                     id         INTEGER PRIMARY KEY,
+                     path       TEXT    NOT NULL UNIQUE,
+                     created_at INTEGER NOT NULL,
+                     width      INTEGER NOT NULL,
+                     height     INTEGER NOT NULL,
+                     source     TEXT    NOT NULL DEFAULT 'capture'
+                 );
+                 CREATE TABLE faces (
+                     id            INTEGER PRIMARY KEY,
+                     screenshot_id INTEGER NOT NULL REFERENCES screenshots(id) ON DELETE CASCADE,
+                     box_x         REAL    NOT NULL,
+                     box_y         REAL    NOT NULL,
+                     box_w         REAL    NOT NULL,
+                     box_h         REAL    NOT NULL,
+                     score         REAL    NOT NULL
+                 );",
+            )
+            .unwrap();
+        }
+
+        with_conn(|_| Ok(())).unwrap();
+
+        with_conn(|conn| {
+            let cols: Vec<String> = conn
+                .prepare("PRAGMA table_info(faces)")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert!(cols.iter().any(|c| c == "cluster_id"), "columns: {cols:?}");
+
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+                .unwrap();
+            let idx: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert!(
+                idx.iter().any(|i| i == "idx_faces_cluster"),
+                "cluster index missing: {idx:?}"
+            );
+            assert!(
+                idx.iter().any(|i| i == "idx_faces_screenshot"),
+                "screenshot index missing: {idx:?}"
+            );
+
+            // And the cluster tables the People view needs exist too.
+            let mut tstmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .unwrap();
+            let tables: Vec<String> = tstmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            for want in ["face_clusters", "face_links", "face_vec"] {
+                assert!(
+                    tables.iter().any(|t| t == want),
+                    "{want} missing: {tables:?}"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+    }
 }
 
 /// A row the indexer still owes work on.
@@ -639,6 +893,7 @@ pub struct Pending {
     pub path: String,
     pub needs_ocr: bool,
     pub needs_embedding: bool,
+    pub needs_faces: bool,
 }
 
 /// Rows that are not fully indexed yet. `limit` keeps each pass bounded.
@@ -656,40 +911,77 @@ pub struct Pending {
 /// of silently mixing two incompatible vector spaces (BM7). Rows already marked
 /// `skipped` stay pending by design. Rows inside their failure backoff window
 /// are withheld until `embed_retry_at` passes (BM4).
-pub fn pending(limit: u32, model: &str) -> Result<Vec<Pending>, String> {
+///
+/// `ocr_enabled` says whether the OCR environment can actually run. When it
+/// cannot, no OCR work is offered at all: these rows sort first, so offering
+/// them anyway would pin them at the head of the queue and starve the
+/// embedding pass for good. BH1, inverted.
+pub fn pending(
+    limit: u32,
+    model: &str,
+    ocr_enabled: bool,
+    face_model: Option<&str>,
+) -> Result<Vec<Pending>, String> {
+    // Opt-in: `None` offers no face work at all. `Some(label)` offers each row
+    // once; afterwards only a model change re-offers it. The query text is
+    // built statically per case so the bound parameter count always matches
+    // the placeholders actually present (binding an unused ?4 errors).
+    let face_clause: &str = match face_model {
+        None => "(0)",
+        Some(_) => {
+            "(face_indexed_at IS NULL OR (face_model IS NOT ?4 AND face_model IS NOT NULL))"
+        }
+    };
+    let ocr_clause: &str = if ocr_enabled {
+        "(ocr_boxes IS NULL)"
+    } else {
+        "(0)"
+    };
+    let sql = format!(
+        "SELECT id, path,
+                {ocr_clause} AS needs_ocr,
+                (
+                    (embedded_at IS NULL
+                     OR (embed_model IS NOT ?2 AND embed_model IS NOT 'skipped'))
+                    AND (embed_retry_at IS NULL OR embed_retry_at <= ?3)
+                ) AS needs_embedding,
+                {face_clause} AS needs_faces
+         FROM screenshots
+         WHERE needs_ocr OR needs_embedding OR needs_faces
+         ORDER BY needs_ocr DESC, created_at ASC
+         LIMIT ?1",
+    );
     with_conn(|conn| {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, path,
-                        (ocr_boxes IS NULL) AS needs_ocr,
-                        (
-                            (embedded_at IS NULL
-                             OR (embed_model IS NOT ?2 AND embed_model IS NOT 'skipped'))
-                            AND (embed_retry_at IS NULL OR embed_retry_at <= ?3)
-                        ) AS needs_embedding
-                 FROM screenshots
-                 WHERE needs_ocr OR needs_embedding
-                 ORDER BY needs_ocr DESC, created_at ASC
-                 LIMIT ?1",
-            )
-            .map_err(|e| format!("Prepare failed: {e}"))?;
+        let mut stmt = conn.prepare(&sql).map_err(|e| format!("Prepare failed: {e}"))?;
 
-        let rows = stmt
-            .query_map(
-                params![limit.clamp(1, 200) as i64, model, now_millis()],
-                |row| {
-                    Ok(Pending {
-                        id: row.get(0)?,
-                        path: row.get(1)?,
-                        needs_ocr: row.get::<_, i64>(2)? != 0,
-                        needs_embedding: row.get::<_, i64>(3)? != 0,
-                    })
-                },
-            )
-            .map_err(|e| format!("Query failed: {e}"))?;
-
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Row read failed: {e}"))
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<Pending> {
+            Ok(Pending {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                needs_ocr: row.get::<_, i64>(2)? != 0,
+                needs_embedding: row.get::<_, i64>(3)? != 0,
+                needs_faces: row.get::<_, i64>(4)? != 0,
+            })
+        };
+        let rows = match face_model {
+            None => stmt
+                .query_map(
+                    params![limit.clamp(1, 200) as i64, model, now_millis()],
+                    map_row,
+                )
+                .map_err(|e| format!("Query failed: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Row read failed: {e}"))?,
+            Some(label) => stmt
+                .query_map(
+                    params![limit.clamp(1, 200) as i64, model, now_millis(), label],
+                    map_row,
+                )
+                .map_err(|e| format!("Query failed: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Row read failed: {e}"))?,
+        };
+        Ok(rows)
     })
 }
 
@@ -705,6 +997,669 @@ pub fn set_ocr(id: i64, text: &str, words_json: &str) -> Result<(), String> {
         )
         .map_err(|e| format!("Set OCR failed: {e}"))?;
         Ok(())
+    })
+}
+
+/// Stores one screenshot's faces: rows in `faces`, vectors in `face_vec`,
+/// provenance stamp on the screenshot. Replaces any previous faces for the
+/// row (model change, re-run) — DELETE + INSERT, because `vec0` has no UPSERT.
+///
+/// A face count of zero is a finished pass, not a pending one: the stamp
+/// records "attempted" exactly like `ocr_boxes` does, so text-free and
+/// face-free screenshots are not re-offered forever.
+pub fn set_faces(id: i64, hits: &[crate::face::FaceHit], model: &str) -> Result<(), String> {
+    let now = now_millis();
+    with_conn(|conn| {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Transaction failed: {e}"))?;
+        let old: Vec<i64> = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM faces WHERE screenshot_id = ?1")
+                .map_err(|e| format!("Face read failed: {e}"))?;
+            let ids = stmt
+                .query_map(params![id], |r| r.get(0))
+                .map_err(|e| format!("Face read failed: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Face read failed: {e}"))?;
+            ids
+        };
+        for fid in &old {
+            delete_face_vector(&tx, *fid)
+                .map_err(|e| format!("Face vector delete failed: {e}"))?;
+        }
+        tx.execute("DELETE FROM faces WHERE screenshot_id = ?1", params![id])
+            .map_err(|e| format!("Face delete failed: {e}"))?;
+        for h in hits {
+            tx.execute(
+                "INSERT INTO faces (screenshot_id, box_x, box_y, box_w, box_h, score)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, h.box_xywh[0], h.box_xywh[1], h.box_xywh[2], h.box_xywh[3], h.score],
+            )
+            .map_err(|e| format!("Face write failed: {e}"))?;
+            let fid = tx.last_insert_rowid();
+            // vec0 has no UPSERT, and `faces.id` reuses the rowid of a deleted
+            // row wherever the table predates `AUTOINCREMENT`. A vector left at
+            // that id then fails this insert with "UNIQUE constraint failed on
+            // face_vec primary key", the stamp below never runs, and the
+            // screenshot is re-offered (with a recluster) on every pass
+            // forever. Delete first, then insert.
+            delete_face_vector(&tx, fid)
+                .map_err(|e| format!("Face vector delete failed: {e}"))?;
+            let bytes = crate::embedder::to_f32_bytes(&h.embedding);
+            tx.execute(
+                "INSERT INTO face_vec(rowid, embedding) VALUES (?1, ?2)",
+                params![fid, bytes],
+            )
+            .map_err(|e| format!("Face vector write failed: {e}"))?;
+        }
+        tx.execute(
+            "UPDATE screenshots SET face_indexed_at = ?1, face_model = ?2, face_count = ?3 WHERE id = ?4",
+            params![now, model, hits.len() as i64, id],
+        )
+        .map_err(|e| format!("Face stamp failed: {e}"))?;
+        tx.commit().map_err(|e| format!("Commit failed: {e}"))
+    })
+}
+
+/// One face row with its embedding, for clustering.
+pub struct ClusterInput {
+    pub face_id: i64,
+    pub embedding: Vec<f32>,
+    /// Assignment from the previous run, used to keep cluster ids stable so a
+    /// user-given name stays attached to the same person across reclusters.
+    pub old_cluster: Option<i64>,
+}
+
+/// A cluster for the People view: representative face + member count.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FaceCluster {
+    pub cluster_id: i64,
+    /// User-given name. Auto-ids are never ground truth; this is the editable
+    /// record (plan.md M7).
+    pub label: Option<String>,
+    /// Largest face in the group: the tile image and the 7.6 KNN seed.
+    pub representative_face_id: i64,
+    pub face_count: usize,
+    /// Distinct screenshots this person appears in, newest first.
+    pub screenshot_ids: Vec<i64>,
+}
+
+/// Minimal union-find over input indices.
+struct Dsu {
+    parent: Vec<usize>,
+}
+
+impl Dsu {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n).collect(),
+        }
+    }
+
+    fn find(&mut self, x: usize) -> usize {
+        let mut root = x;
+        while self.parent[root] != root {
+            root = self.parent[root];
+        }
+        let mut cur = x;
+        while self.parent[cur] != root {
+            let next = self.parent[cur];
+            self.parent[cur] = root;
+            cur = next;
+        }
+        root
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra != rb {
+            self.parent[rb] = ra;
+        }
+    }
+}
+
+/// Reclusters every face in the DB: reads all embeddings, runs
+/// average-linkage at `crate::cluster::eps()`, writes `cluster_id` back.
+/// Faces the geometry leaves alone, and empty runs, get NULL (noise, not a
+/// group of one).
+///
+/// Stable ids: `cluster()` returns positional labels that would scramble on
+/// every run, which would detach user names. Instead each new group inherits
+/// the previous cluster id it overlaps most (largest groups claim first), and
+/// only genuinely new people get fresh ids. The user's merges are then replayed
+/// as same-person links, so a merge survives the next batch.
+///
+/// Called after a face batch and by the `recluster_faces` command. O(n^3)
+/// worst case in the merge scan — millisecond-scale at corpus sizes here.
+pub fn recluster_faces() -> Result<usize, String> {
+    let inputs: Vec<ClusterInput> = with_conn(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.id, v.embedding, f.cluster_id FROM faces f
+                 JOIN face_vec v ON v.rowid = f.id ORDER BY f.id",
+            )
+            .map_err(|e| format!("Face read failed: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .map_err(|e| format!("Face read failed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Face read failed: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, bytes, old_cluster)| ClusterInput {
+                face_id: id,
+                embedding: crate::embedder::from_f32_bytes(&bytes),
+                old_cluster,
+            })
+            .collect())
+    })?;
+    if inputs.is_empty() {
+        return Ok(0);
+    }
+
+    let eps = crate::cluster::eps();
+    let vecs: Vec<Vec<f32>> = inputs.iter().map(|i| i.embedding.clone()).collect();
+    let assign = crate::cluster::cluster(&vecs, eps);
+
+    let links: Vec<(i64, i64)> = with_conn(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT a, b FROM face_links")
+            .map_err(|e| format!("Link read failed: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(|e| format!("Link read failed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Link read failed: {e}"))?;
+        Ok(rows)
+    })?;
+
+    let index_of: HashMap<i64, usize> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.face_id, i))
+        .collect();
+    let mut dsu = Dsu::new(inputs.len());
+    // Faces the algorithm grouped together are one component.
+    let mut anchors: HashMap<usize, usize> = HashMap::new();
+    for (i, slot) in assign.iter().enumerate() {
+        if let Some(c) = slot {
+            match anchors.get(c) {
+                Some(&anchor) => dsu.union(anchor, i),
+                None => {
+                    anchors.insert(*c, i);
+                }
+            }
+        }
+    }
+    // A persisted merge unions its two faces (and thus their whole groups).
+    for (a, b) in &links {
+        if let (Some(&ia), Some(&ib)) = (index_of.get(a), index_of.get(b)) {
+            dsu.union(ia, ib);
+        }
+    }
+
+    let mut components: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..inputs.len() {
+        let root = dsu.find(i);
+        components.entry(root).or_default().push(i);
+    }
+    // Only components with >= 2 faces are clusters; a lone face stays noise.
+    let mut groups: Vec<Vec<usize>> = components
+        .into_values()
+        .filter(|g| g.len() >= 2)
+        .collect();
+    groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
+
+    let mut max_id: i64 = with_conn(|conn| {
+        conn.query_row(
+            "SELECT MAX(x) FROM (SELECT MAX(cluster_id) AS x FROM faces
+                                 UNION ALL SELECT MAX(id) FROM face_clusters)",
+            [],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .map_err(|e| format!("Id scan failed: {e}"))
+    })?
+    .unwrap_or(0);
+
+    let mut claimed: HashSet<i64> = HashSet::new();
+    let mut final_ids: Vec<i64> = Vec::with_capacity(groups.len());
+    for group in &groups {
+        let mut counts: HashMap<i64, usize> = HashMap::new();
+        for &i in group {
+            if let Some(old) = inputs[i].old_cluster {
+                *counts.entry(old).or_default() += 1;
+            }
+        }
+        // Old id with the most overlap, if no larger group already took it.
+        let mut best: Option<(i64, usize)> = None;
+        for (id, n) in counts {
+            if claimed.contains(&id) {
+                continue;
+            }
+            if best.map_or(true, |(_, bn)| n > bn) {
+                best = Some((id, n));
+            }
+        }
+        let id = match best {
+            Some((id, _)) => {
+                claimed.insert(id);
+                id
+            }
+            None => {
+                max_id += 1;
+                max_id
+            }
+        };
+        final_ids.push(id);
+    }
+
+    with_conn(|conn| {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Transaction failed: {e}"))?;
+        tx.execute("UPDATE faces SET cluster_id = NULL", [])
+            .map_err(|e| format!("Cluster clear failed: {e}"))?;
+        for id in &final_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO face_clusters(id) VALUES (?1)",
+                params![id],
+            )
+            .map_err(|e| format!("Cluster ensure failed: {e}"))?;
+        }
+        // Drop name rows for clusters that no longer exist.
+        let live: HashSet<i64> = final_ids.iter().copied().collect();
+        let existing: Vec<i64> = tx
+            .prepare("SELECT id FROM face_clusters")
+            .map_err(|e| format!("Cluster read failed: {e}"))?
+            .query_map([], |r| r.get(0))
+            .map_err(|e| format!("Cluster read failed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Cluster read failed: {e}"))?;
+        for id in existing {
+            if !live.contains(&id) {
+                tx.execute("DELETE FROM face_clusters WHERE id = ?1", params![id])
+                    .map_err(|e| format!("Cluster prune failed: {e}"))?;
+            }
+        }
+        let mut written = 0;
+        for (group, id) in groups.iter().zip(final_ids.iter()) {
+            for &i in group {
+                tx.execute(
+                    "UPDATE faces SET cluster_id = ?1 WHERE id = ?2",
+                    params![id, inputs[i].face_id],
+                )
+                .map_err(|e| format!("Cluster write failed: {e}"))?;
+                written += 1;
+            }
+        }
+        tx.commit().map_err(|e| format!("Commit failed: {e}"))?;
+        Ok(written)
+    })
+}
+
+/// Clusters for the People view, largest first. Screenshot ids are deduped
+/// so "this person appears in N shots" reads correctly, and the representative
+/// is the largest face (`box_w * box_h`) — small faces embed worse, so the
+/// biggest one is both the best tile and the best KNN seed.
+pub fn face_clusters() -> Result<Vec<FaceCluster>, String> {
+    with_conn(|conn| {
+        let labels: HashMap<i64, Option<String>> = {
+            let mut stmt = conn
+                .prepare("SELECT id, label FROM face_clusters")
+                .map_err(|e| format!("Label read failed: {e}"))?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))
+                .map_err(|e| format!("Label read failed: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Label read failed: {e}"))?;
+            rows.into_iter().collect()
+        };
+        let mut stmt = conn
+            .prepare(
+                "SELECT cluster_id, id, screenshot_id FROM faces
+                 WHERE cluster_id IS NOT NULL
+                 ORDER BY cluster_id, (box_w * box_h) DESC, id",
+            )
+            .map_err(|e| format!("Cluster read failed: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| format!("Cluster read failed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Cluster read failed: {e}"))?;
+        let mut out: Vec<FaceCluster> = vec![];
+        for (cid, fid, sid) in rows {
+            match out.last_mut() {
+                Some(c) if c.cluster_id == cid => {
+                    c.face_count += 1;
+                    if !c.screenshot_ids.contains(&sid) {
+                        c.screenshot_ids.push(sid);
+                    }
+                }
+                _ => out.push(FaceCluster {
+                    cluster_id: cid,
+                    label: labels.get(&cid).cloned().flatten(),
+                    representative_face_id: fid,
+                    face_count: 1,
+                    screenshot_ids: vec![sid],
+                }),
+            }
+        }
+        out.sort_by_key(|c| std::cmp::Reverse(c.face_count));
+        Ok(out)
+    })
+}
+
+/// Rename a cluster. An empty/whitespace label clears the name (the built-in
+/// "Person N" placeholder takes over again).
+pub fn rename_cluster(cluster_id: i64, label: Option<String>) -> Result<(), String> {
+    let clean = label
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty());
+    with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO face_clusters(id, label) VALUES (?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET label = excluded.label",
+            params![cluster_id, clean],
+        )
+        .map_err(|e| format!("Rename failed: {e}"))?;
+        Ok(())
+    })
+}
+
+/// Merge `from` into `into`: reassign the faces now, and record a same-person
+/// link so the union is re-applied on every future recluster (a merge the next
+/// batch could silently undo is not a merge). Returns faces moved.
+pub fn merge_clusters(from: i64, into: i64) -> Result<usize, String> {
+    if from == into {
+        return Ok(0);
+    }
+    with_conn(|conn| {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Transaction failed: {e}"))?;
+        let rep = |cid: i64| -> Result<Option<i64>, String> {
+            tx.query_row(
+                "SELECT id FROM faces WHERE cluster_id = ?1
+                 ORDER BY (box_w * box_h) DESC, id LIMIT 1",
+                params![cid],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Representative read failed: {e}"))
+        };
+        if let (Some(a), Some(b)) = (rep(from)?, rep(into)?) {
+            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+            tx.execute(
+                "INSERT OR IGNORE INTO face_links(a, b) VALUES (?1, ?2)",
+                params![lo, hi],
+            )
+            .map_err(|e| format!("Link write failed: {e}"))?;
+        }
+        let moved = tx
+            .execute(
+                "UPDATE faces SET cluster_id = ?1 WHERE cluster_id = ?2",
+                params![into, from],
+            )
+            .map_err(|e| format!("Merge failed: {e}"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO face_clusters(id) VALUES (?1)",
+            params![into],
+        )
+        .map_err(|e| format!("Merge failed: {e}"))?;
+        // Keep whichever name exists; the target wins if both are set.
+        tx.execute(
+            "UPDATE face_clusters
+             SET label = COALESCE(label, (SELECT label FROM face_clusters WHERE id = ?1))
+             WHERE id = ?2",
+            params![from, into],
+        )
+        .map_err(|e| format!("Merge failed: {e}"))?;
+        tx.execute("DELETE FROM face_clusters WHERE id = ?1", params![from])
+            .map_err(|e| format!("Merge failed: {e}"))?;
+        tx.commit().map_err(|e| format!("Commit failed: {e}"))?;
+        Ok(moved)
+    })
+}
+
+/// Forget one person: their face rows, vectors, name and merge links.
+///
+/// Screenshots are untouched, and `face_indexed_at` stays stamped on purpose —
+/// un-stamping would make the next indexer pass re-detect exactly the person who
+/// was deleted. Only a face-model change brings them back.
+pub fn forget_cluster(cluster_id: i64) -> Result<usize, String> {
+    with_conn(|conn| {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Transaction failed: {e}"))?;
+        let members: Vec<(i64, i64)> = {
+            let mut stmt = tx
+                .prepare("SELECT id, screenshot_id FROM faces WHERE cluster_id = ?1")
+                .map_err(|e| format!("Face read failed: {e}"))?;
+            let rows = stmt
+                .query_map(params![cluster_id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                })
+                .map_err(|e| format!("Face read failed: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Face read failed: {e}"))?;
+            rows
+        };
+        if members.is_empty() {
+            // Nothing to forget; drop any stale name row so it cannot shadow a
+            // future cluster that inherits this id.
+            tx.execute(
+                "DELETE FROM face_clusters WHERE id = ?1",
+                params![cluster_id],
+            )
+            .map_err(|e| format!("Cluster delete failed: {e}"))?;
+            tx.commit().map_err(|e| format!("Commit failed: {e}"))?;
+            return Ok(0);
+        }
+
+        for (fid, _) in &members {
+            // vec0 has no cascade: the vector goes explicitly or it is orphaned.
+            delete_face_vector(&tx, *fid)
+                .map_err(|e| format!("Face vector delete failed: {e}"))?;
+            // A link between two deleted faces would outlive them and union
+            // unrelated people on the next recluster.
+            tx.execute(
+                "DELETE FROM face_links WHERE a = ?1 OR b = ?1",
+                params![fid],
+            )
+            .map_err(|e| format!("Face link delete failed: {e}"))?;
+        }
+        tx.execute(
+            "DELETE FROM faces WHERE cluster_id = ?1",
+            params![cluster_id],
+        )
+        .map_err(|e| format!("Face delete failed: {e}"))?;
+        tx.execute(
+            "DELETE FROM face_clusters WHERE id = ?1",
+            params![cluster_id],
+        )
+        .map_err(|e| format!("Cluster delete failed: {e}"))?;
+
+        let mut shots: Vec<i64> = members.iter().map(|(_, sid)| *sid).collect();
+        shots.sort_unstable();
+        shots.dedup();
+        for sid in &shots {
+            tx.execute(
+                "UPDATE screenshots SET face_count =
+                     (SELECT COUNT(*) FROM faces WHERE screenshot_id = ?1)
+                 WHERE id = ?1",
+                params![sid],
+            )
+            .map_err(|e| format!("Face count update failed: {e}"))?;
+        }
+
+        tx.commit().map_err(|e| format!("Commit failed: {e}"))?;
+        Ok(members.len())
+    })
+}
+
+/// One person's screenshots, newest first (7.5 click-through).
+pub fn cluster_screenshots(cluster_id: i64) -> Result<Vec<Screenshot>, String> {
+    with_conn(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT s.path, s.created_at, s.width, s.height, s.source
+                 FROM faces f JOIN screenshots s ON s.id = f.screenshot_id
+                 WHERE f.cluster_id = ?1
+                 ORDER BY s.created_at DESC",
+            )
+            .map_err(|e| format!("Prepare failed: {e}"))?;
+        let rows = stmt
+            .query_map(params![cluster_id], screenshot_row)
+            .map_err(|e| format!("Query failed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Row read failed: {e}"))?;
+        Ok(rows)
+    })
+}
+
+/// Screenshot path plus the face's pixel box, for cropping a tile.
+pub fn face_box(face_id: i64) -> Result<(String, [f32; 4]), String> {
+    with_conn(|conn| {
+        conn.query_row(
+            "SELECT s.path, f.box_x, f.box_y, f.box_w, f.box_h
+             FROM faces f JOIN screenshots s ON s.id = f.screenshot_id
+             WHERE f.id = ?1",
+            params![face_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    [
+                        r.get::<_, f64>(1)? as f32,
+                        r.get::<_, f64>(2)? as f32,
+                        r.get::<_, f64>(3)? as f32,
+                        r.get::<_, f64>(4)? as f32,
+                    ],
+                ))
+            },
+        )
+        .map_err(|e| format!("Face not found: {e}"))
+    })
+}
+
+/// 7.6: screenshots whose faces are nearest to `face_id`, by SFace cosine.
+/// Multiple faces in one screenshot collapse to that screenshot's best match.
+/// Deliberately *not* limited to the seed's cluster: the point is to surface
+/// matches the geometry left as singletons or noise.
+pub fn search_by_face(face_id: i64, limit: Option<u32>) -> Result<Vec<SearchHit>, String> {
+    let limit = limit.unwrap_or(60).clamp(1, 200);
+    with_conn(|conn| {
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT embedding FROM face_vec WHERE rowid = ?1",
+                params![face_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("Reference face not found: {e}"))?;
+        // Over-fetch: one screenshot can hold several faces, and rows collapse.
+        let k = (limit * 4).clamp(limit, 400) as i64;
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.screenshot_id, v.distance FROM face_vec v
+                 JOIN faces f ON f.id = v.rowid
+                 WHERE v.embedding MATCH ?1 AND v.k = ?2
+                 ORDER BY v.distance",
+            )
+            .map_err(|e| format!("Prepare failed: {e}"))?;
+        let rows = stmt
+            .query_map(params![bytes, k], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+            })
+            .map_err(|e| format!("Query failed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Row read failed: {e}"))?;
+
+        let mut seen: HashSet<i64> = HashSet::new();
+        let mut best: Vec<(i64, f64)> = Vec::new();
+        for (sid, distance) in rows {
+            if seen.insert(sid) {
+                best.push((sid, distance));
+            }
+            if best.len() >= limit as usize {
+                break;
+            }
+        }
+
+        let mut hits: Vec<SearchHit> = Vec::with_capacity(best.len());
+        for (sid, distance) in best {
+            let hit = conn
+                .query_row(
+                    "SELECT path, created_at, width, height, source FROM screenshots WHERE id = ?1",
+                    params![sid],
+                    |r| {
+                        Ok(SearchHit::visual(
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            distance,
+                        ))
+                    },
+                )
+                .map_err(|e| format!("Screenshot read failed: {e}"))?;
+            hits.push(hit);
+        }
+        let cosines: Vec<f64> = hits
+            .iter()
+            .map(|h| h.score.unwrap_or(0.0) as f64)
+            .collect();
+        for (hit, z) in hits.iter_mut().zip(standardise(&cosines)) {
+            hit.score_z = Some(z as f32);
+        }
+        Ok(hits)
+    })
+}
+
+
+/// Face-clustering progress, for the People view.
+///
+/// `screenshots_indexed` counts *attempted* passes, so a screenshot with no
+/// face in it still counts as done — otherwise the bar could never reach the
+/// end, which is the exact mistake `ocr_boxes` already documents for OCR.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct FaceProgress {
+    pub face_count: i64,
+    pub clustered_faces: i64,
+    pub cluster_count: i64,
+    pub screenshots_indexed: i64,
+    pub screenshots_total: i64,
+}
+
+pub fn face_progress() -> Result<FaceProgress, String> {
+    with_conn(|conn| {
+        let count = |sql: &str| -> Result<i64, String> {
+            conn.query_row(sql, [], |r| r.get(0))
+                .map_err(|e| format!("Count failed: {e}"))
+        };
+        Ok(FaceProgress {
+            face_count: count("SELECT COUNT(*) FROM faces")?,
+            clustered_faces: count("SELECT COUNT(*) FROM faces WHERE cluster_id IS NOT NULL")?,
+            cluster_count: count(
+                "SELECT COUNT(DISTINCT cluster_id) FROM faces WHERE cluster_id IS NOT NULL",
+            )?,
+            screenshots_indexed: count(
+                "SELECT COUNT(*) FROM screenshots WHERE face_indexed_at IS NOT NULL",
+            )?,
+            screenshots_total: count("SELECT COUNT(*) FROM screenshots")?,
+        })
     })
 }
 
@@ -1690,7 +2645,7 @@ fn prune_removes_gone_rows_and_their_search_entries() {
         .unwrap();
 
         let model = crate::embedder::DEFAULT_MODEL_LABEL;
-        let rows = pending(25, model).unwrap();
+        let rows = pending(25, model, true, None).unwrap();
         let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(
             paths,
@@ -1703,8 +2658,178 @@ fn prune_removes_gone_rows_and_their_search_entries() {
         // server is actually available.
         mark_embedding_skipped(rows[2].id).unwrap();
         assert!(
-            pending(25, model).unwrap().iter().any(|r| r.path == "/tmp/old.png"),
+            pending(25, model, true, None).unwrap().iter().any(|r| r.path == "/tmp/old.png"),
             "a skipped row must stay pending or it never gets embedded"
+        );
+
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+    }
+
+    /// BH1, inverted: when the OCR environment cannot run, its rows must not be
+    /// offered at all. They sort first, so offering them anyway pins them at
+    /// the head of the queue and the embedding pass never sees a row again --
+    /// a library that silently stops being visually searchable.
+    #[test]
+    fn ocr_rows_are_withheld_when_ocr_cannot_run() {
+        let _guard = test_lock();
+        let db = std::env::temp_dir().join("xreenshoty-ocr-gate.db");
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+        std::env::set_var("XREENSHOTY_TEST_DB", &db);
+        with_conn(|_| Ok(())).unwrap();
+
+        with_conn(|conn| {
+            // A row that owes text and nothing else: embedded by the current
+            // model, but never OCR'd. This is the row that starves the queue.
+            conn.execute(
+                "INSERT INTO screenshots (path, created_at, width, height, source, embedded_at, embed_model)
+                 VALUES ('/tmp/owes-text.png', 1, 1, 1, 'capture', 100, ?1)",
+                params![crate::embedder::DEFAULT_MODEL_LABEL],
+            )
+            .map_err(|e| format!("insert: {e}"))?;
+            // A row that owes a vector.
+            conn.execute(
+                "INSERT INTO screenshots (path, created_at, width, height, source, ocr_boxes)
+                 VALUES ('/tmp/owes-vector.png', 2, 1, 1, 'capture', '[]')",
+                [],
+            )
+            .map_err(|e| format!("insert: {e}"))?;
+            Ok(())
+        })
+        .unwrap();
+
+        let model = crate::embedder::DEFAULT_MODEL_LABEL;
+
+        let with_ocr = pending(25, model, true, None).unwrap();
+        assert!(
+            with_ocr.iter().any(|r| r.path == "/tmp/owes-text.png"),
+            "with OCR available the text-needing row must be offered"
+        );
+
+        let without_ocr = pending(25, model, false, None).unwrap();
+        assert!(
+            !without_ocr.iter().any(|r| r.path == "/tmp/owes-text.png"),
+            "with OCR unavailable the text-needing row must not be offered at all"
+        );
+        assert!(
+            without_ocr.iter().any(|r| r.path == "/tmp/owes-vector.png"),
+            "the embedding pass must keep working while OCR is unavailable"
+        );
+
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+    }
+
+    /// The whole chain, against the real database: OCR a screenshot, store the
+    /// result, and find it again with a keyword search. This is the path the
+    /// indexer drives, and it is where the FTS trigger and the text format
+    /// have to agree.
+    #[test]
+    #[ignore = "needs the ocr-env venv, the Indra models and a real screenshot"]
+    fn ocr_text_is_searchable_after_it_is_stored() {
+        let _guard = test_lock();
+        let db = std::env::temp_dir().join("xreenshoty-ocr-search.db");
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+        std::env::set_var("XREENSHOTY_TEST_DB", &db);
+        with_conn(|_| Ok(())).unwrap();
+
+        let pictures = dirs::home_dir().expect("home").join("Pictures");
+        let mut files: Vec<String> = std::fs::read_dir(&pictures)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("png"))
+                    })
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        if files.is_empty() {
+            eprintln!("skipping: no PNGs in {}", pictures.display());
+            return;
+        }
+        let files = &files[..files.len().min(8)];
+
+        let results = crate::ocr::run_batch(files).expect("OCR batch failed");
+        let Some((path, result)) = results
+            .iter()
+            .zip(files)
+            .find_map(|(outcome, path)| outcome.as_ref().ok().map(|r| (path, r)))
+            .filter(|(_, r)| !r.text.trim().is_empty())
+        else {
+            eprintln!("skipping: no text in the sample");
+            return;
+        };
+
+        // A word long enough not to be a typo and not a stop word.
+        let word = result
+            .words
+            .iter()
+            .map(|w| w.text.as_str())
+            .find(|w| w.len() > 5 && w.chars().all(|c| c.is_alphanumeric()))
+            .expect("a word to search for")
+            .to_lowercase();
+
+        with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO screenshots (path, created_at, width, height, source)
+                 VALUES (?1, 1, 100, 100, 'capture')",
+                params![path],
+            )
+            .map_err(|e| format!("insert: {e}"))?;
+            Ok(())
+        })
+        .unwrap();
+        let id: i64 = with_conn(|conn| {
+            conn.query_row(
+                "SELECT id FROM screenshots WHERE path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("row read failed: {e}"))
+        })
+        .unwrap();
+        let words = serde_json::to_string(&result.words).unwrap();
+        set_ocr(id, &result.text, &words).expect("store the OCR text");
+
+        // The row is now done: it must not be offered again.
+        let still_pending = pending(25, crate::embedder::DEFAULT_MODEL_LABEL, true, None)
+            .unwrap()
+            .iter()
+            .any(|r| r.id == id);
+        assert!(!still_pending, "an OCR'd row must not stay pending");
+        assert_eq!(index_progress().unwrap().ocred, 1);
+
+        let expr = fts_query(&word).expect("a searchable term");
+        let hits: Vec<String> = with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT s.path FROM screenshots_fts
+                     JOIN screenshots s ON s.id = screenshots_fts.rowid
+                     WHERE screenshots_fts MATCH ?1",
+                )
+                .map_err(|e| format!("prepare: {e}"))?;
+            let rows = stmt
+                .query_map(params![expr], |r| r.get::<_, String>(0))
+                .map_err(|e| format!("query: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("row read failed: {e}"))
+        })
+        .unwrap();
+        assert!(
+            hits.iter().any(|h| h == path),
+            "the word {word:?} must find {path}"
         );
 
         for suffix in ["", "-wal", "-shm"] {
@@ -1737,14 +2862,14 @@ fn prune_removes_gone_rows_and_their_search_entries() {
         .unwrap();
 
         assert!(
-            pending(25, crate::embedder::DEFAULT_MODEL_LABEL)
+            pending(25, crate::embedder::DEFAULT_MODEL_LABEL, true, None)
                 .unwrap()
                 .iter()
                 .any(|r| r.path == "/tmp/old-model.png"),
             "a vector embedded by another model must be re-embedded"
         );
         assert!(
-            !pending(25, "some-other-model")
+            !pending(25, "some-other-model", true, None)
                 .unwrap()
                 .iter()
                 .any(|r| r.path == "/tmp/old-model.png"),
@@ -1781,7 +2906,7 @@ fn prune_removes_gone_rows_and_their_search_entries() {
         .unwrap();
 
         // Backoff expired (epoch 0): the row is offered.
-        assert!(pending(25, crate::embedder::DEFAULT_MODEL_LABEL)
+        assert!(pending(25, crate::embedder::DEFAULT_MODEL_LABEL, true, None)
             .unwrap()
             .iter()
             .any(|r| r.id == id));
@@ -1791,7 +2916,7 @@ fn prune_removes_gone_rows_and_their_search_entries() {
         assert_eq!(attempts, 1);
 
         assert!(
-            !pending(25, crate::embedder::DEFAULT_MODEL_LABEL)
+            !pending(25, crate::embedder::DEFAULT_MODEL_LABEL, true, None)
                 .unwrap()
                 .iter()
                 .any(|r| r.id == id),
@@ -1809,6 +2934,365 @@ fn prune_removes_gone_rows_and_their_search_entries() {
             Ok(())
         })
         .unwrap();
+
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+    }
+
+    /// A pre-AUTOINCREMENT `faces` table reuses the id of a deleted row. A
+    /// vector left orphaned at that id (a face deleted without its vector)
+    /// collides, and vec0 has no UPSERT, so `set_faces` failed on the primary
+    /// key, never stamped the screenshot, and the indexer re-offered it -- with
+    /// a full recluster -- on every pass.
+    #[test]
+    fn a_reused_face_rowid_survives_an_orphaned_vector() {
+        let _guard = test_lock();
+        let db = std::env::temp_dir().join("xreenshoty-face-orphan.db");
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+        std::env::set_var("XREENSHOTY_TEST_DB", &db);
+
+        // The shape every install created before AUTOINCREMENT still has.
+        {
+            let old = Connection::open(&db).unwrap();
+            old.execute_batch(
+                "CREATE TABLE screenshots (
+                     id         INTEGER PRIMARY KEY,
+                     path       TEXT    NOT NULL UNIQUE,
+                     created_at INTEGER NOT NULL,
+                     width      INTEGER NOT NULL,
+                     height     INTEGER NOT NULL,
+                     source     TEXT    NOT NULL DEFAULT 'capture'
+                 );
+                 CREATE TABLE faces (
+                     id            INTEGER PRIMARY KEY,
+                     screenshot_id INTEGER NOT NULL REFERENCES screenshots(id) ON DELETE CASCADE,
+                     box_x         REAL    NOT NULL,
+                     box_y         REAL    NOT NULL,
+                     box_w         REAL    NOT NULL,
+                     box_h         REAL    NOT NULL,
+                     score         REAL    NOT NULL
+                 );",
+            )
+            .unwrap();
+        }
+
+        let mk = |path: &str| {
+            with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO screenshots
+                         (path, created_at, width, height, source, ocr_boxes)
+                     VALUES (?1, 1, 10, 10, 'capture', '[]')",
+                    params![path],
+                )
+                .map_err(|e| format!("insert: {e}"))?;
+                Ok(conn.last_insert_rowid())
+            })
+            .unwrap()
+        };
+        let hit = || crate::face::FaceHit {
+            box_xywh: [0.0, 0.0, 100.0, 100.0],
+            score: 0.9,
+            embedding: (0..crate::face::FACE_DIM)
+                .map(|i| i as f32 / 128.0)
+                .collect(),
+        };
+
+        let first = mk("/tmp/orphan-a.png");
+        set_faces(first, &[hit(), hit()], crate::face::FACE_MODEL).unwrap();
+
+        // Drop the newest face row but leave its vector: the orphan sits on the
+        // highest id, which the next detected face will be given.
+        with_conn(|conn| {
+            conn.execute("DELETE FROM faces WHERE id = (SELECT MAX(id) FROM faces)", [])
+                .map_err(|e| format!("drop face: {e}"))?;
+            Ok(())
+        })
+        .unwrap();
+
+        let second = mk("/tmp/orphan-b.png");
+        set_faces(second, &[hit()], crate::face::FACE_MODEL)
+            .expect("a reused rowid must not collide with an orphaned vector");
+
+        let (faces, vectors, stamped) = with_conn(|conn| {
+            let faces: i64 = conn
+                .query_row("SELECT COUNT(*) FROM faces", [], |r| r.get(0))
+                .map_err(|e| format!("count: {e}"))?;
+            let vectors: i64 = conn
+                .query_row("SELECT COUNT(*) FROM face_vec", [], |r| r.get(0))
+                .map_err(|e| format!("count: {e}"))?;
+            let stamped: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM screenshots WHERE face_indexed_at IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("stamp: {e}"))?;
+            Ok((faces, vectors, stamped))
+        })
+        .unwrap();
+        assert_eq!(
+            (faces, vectors),
+            (2, 2),
+            "the orphan must be replaced, not left beside the new vector"
+        );
+        assert_eq!(stamped, 2, "a stored pass must stamp the screenshot");
+
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+    }
+
+    /// Faces: `set_faces` writes rows + vectors + stamp in one transaction, a
+    /// second call replaces the first (model change), and `pending` offers the
+    /// row exactly once per model label — never when the toggle is off.
+    #[test]
+    fn faces_are_stored_replaced_and_offered_once_per_model() {
+        let _guard = test_lock();
+        let db = std::env::temp_dir().join("xreenshoty-faces.db");
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+        std::env::set_var("XREENSHOTY_TEST_DB", &db);
+        with_conn(|_| Ok(())).unwrap();
+
+        let id = with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO screenshots
+                     (path, created_at, width, height, source, ocr_boxes, embedded_at, embed_model)
+                 VALUES ('/tmp/face.png', 1, 10, 10, 'capture', '[]', 1, 'embeddinggemma-2-q8_0')",
+                [],
+            )
+            .map_err(|e| format!("insert: {e}"))?;
+            Ok(conn.last_insert_rowid())
+        })
+        .unwrap();
+
+        let hit = || crate::face::FaceHit {
+            box_xywh: [1.0, 2.0, 100.0, 120.0],
+            score: 0.9,
+            embedding: (0..crate::face::FACE_DIM).map(|i| i as f32 / 128.0).collect(),
+        };
+
+        // Off means never offered.
+        let model = crate::embedder::DEFAULT_MODEL_LABEL;
+        assert!(!pending(25, model, true, None).unwrap().iter().any(|r| r.id == id));
+        // On means offered once.
+        let rows = pending(25, model, true, Some(crate::face::FACE_MODEL)).unwrap();
+        assert!(rows.iter().any(|r| r.id == id && r.needs_faces));
+
+        // Store two faces, check rows + stamp + KNN ranking.
+        set_faces(id, &[hit(), hit()], crate::face::FACE_MODEL).unwrap();
+        let (nfaces, nvec, stamp, count): (i64, i64, String, i64) = with_conn(|conn| {
+            let nfaces: i64 = conn
+                .query_row("SELECT COUNT(*) FROM faces WHERE screenshot_id = ?1", params![id], |r| r.get(0))
+                .map_err(|e| format!("count faces: {e}"))?;
+            let nvec: i64 = conn
+                .query_row("SELECT COUNT(*) FROM face_vec", [], |r| r.get(0))
+                .map_err(|e| format!("count vec: {e}"))?;
+            let (stamp, count): (String, i64) = conn
+                .query_row(
+                    "SELECT face_model, face_count FROM screenshots WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|e| format!("stamp: {e}"))?;
+            Ok((nfaces, nvec, stamp, count))
+        })
+        .unwrap();
+        assert_eq!((nfaces, nvec, count), (2, 2, 2));
+        assert_eq!(stamp, crate::face::FACE_MODEL);
+
+        // Zero faces is a finished pass, not a pending one.
+        set_faces(id, &[], crate::face::FACE_MODEL).unwrap();
+        let (nfaces2, nvec2): (i64, i64) = with_conn(|conn| {
+            let nfaces2: i64 = conn
+                .query_row("SELECT COUNT(*) FROM faces", [], |r| r.get(0))
+                .map_err(|e| format!("count: {e}"))?;
+            let nvec2: i64 = conn
+                .query_row("SELECT COUNT(*) FROM face_vec", [], |r| r.get(0))
+                .map_err(|e| format!("count: {e}"))?;
+            Ok((nfaces2, nvec2))
+        })
+        .unwrap();
+        assert_eq!((nfaces2, nvec2), (0, 0), "replace must delete stale vectors");
+        assert!(
+            !pending(25, model, true, Some(crate::face::FACE_MODEL))
+                .unwrap()
+                .iter()
+                .any(|r| r.id == id),
+            "a stamped row must not be re-offered for the same model"
+        );
+        // A model change re-offers it.
+        assert!(
+            pending(25, model, true, Some("some-other-face-model"))
+                .unwrap()
+                .iter()
+                .any(|r| r.id == id && r.needs_faces),
+            "a model change must re-offer the row"
+        );
+
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+    }
+
+    /// Forgetting a person drops their faces, vectors, name and merge links,
+    /// keeps the screenshots, and leaves them stamped: un-stamping would make
+    /// the next indexer pass re-detect the person just deleted.
+    #[test]
+    fn forgetting_a_person_removes_faces_but_keeps_screenshots() {
+        let _guard = test_lock();
+        let db = std::env::temp_dir().join("xreenshoty-forget.db");
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+        std::env::set_var("XREENSHOTY_TEST_DB", &db);
+        with_conn(|_| Ok(())).unwrap();
+
+        let mk = |path: &str| {
+            with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO screenshots
+                         (path, created_at, width, height, source, ocr_boxes)
+                     VALUES (?1, 1, 10, 10, 'capture', '[]')",
+                    params![path],
+                )
+                .map_err(|e| format!("insert: {e}"))?;
+                Ok(conn.last_insert_rowid())
+            })
+            .unwrap()
+        };
+        let hit = |seed: f32| crate::face::FaceHit {
+            box_xywh: [0.0, 0.0, 100.0, 100.0],
+            score: 0.9,
+            embedding: (0..crate::face::FACE_DIM)
+                .map(|i| (seed + i as f32 * 0.001).sin())
+                .collect(),
+        };
+
+        let a = mk("/tmp/forget-a.png");
+        let b = mk("/tmp/forget-b.png");
+        set_faces(a, &[hit(1.0), hit(1.01)], crate::face::FACE_MODEL).unwrap();
+        set_faces(b, &[hit(50.0)], crate::face::FACE_MODEL).unwrap();
+        recluster_faces().unwrap();
+
+        let clusters = face_clusters().unwrap();
+        assert_eq!(clusters.len(), 1, "only the pair must group");
+        let cid = clusters[0].cluster_id;
+        rename_cluster(cid, Some("Wrong person".into())).unwrap();
+
+        let fids: Vec<i64> = with_conn(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT id FROM faces WHERE cluster_id = ?1")
+                .map_err(|e| format!("prepare: {e}"))?;
+            let ids = stmt
+                .query_map(params![cid], |r| r.get(0))
+                .map_err(|e| format!("query: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read: {e}"))?;
+            Ok(ids)
+        })
+        .unwrap();
+        assert_eq!(fids.len(), 2, "the outlier must stay out of the cluster");
+        // A merge link must not survive its faces, or the next recluster unions
+        // whoever inherits those ids.
+        with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO face_links(a, b) VALUES (?1, ?2)",
+                params![fids[0].min(fids[1]), fids[0].max(fids[1])],
+            )
+            .map_err(|e| format!("link: {e}"))?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(forget_cluster(cid).unwrap(), 2);
+
+        assert!(face_clusters().unwrap().is_empty(), "the person must be gone");
+        let (faces, vectors, names, links, stamped, shots) = with_conn(|conn| {
+            let one = |sql: &str| -> Result<i64, String> {
+                conn.query_row(sql, [], |r| r.get(0))
+                    .map_err(|e| format!("count: {e}"))
+            };
+            Ok((
+                one("SELECT COUNT(*) FROM faces")?,
+                one("SELECT COUNT(*) FROM face_vec")?,
+                one("SELECT COUNT(*) FROM face_clusters")?,
+                one("SELECT COUNT(*) FROM face_links")?,
+                one("SELECT COUNT(*) FROM screenshots WHERE face_indexed_at IS NOT NULL")?,
+                one("SELECT COUNT(*) FROM screenshots")?,
+            ))
+        })
+        .unwrap();
+        assert_eq!((faces, vectors, names, links), (1, 1, 0, 0));
+        assert_eq!(
+            (stamped, shots),
+            (2, 2),
+            "screenshots stay, and stay stamped"
+        );
+
+        let count: i64 = with_conn(|conn| {
+            conn.query_row(
+                "SELECT face_count FROM screenshots WHERE id = ?1",
+                params![a],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("count: {e}"))
+        })
+        .unwrap();
+        assert_eq!(count, 0, "the stored face count must not overcount");
+
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+    }
+
+    /// 7.4: near-identical embeddings land in one cluster, the outlier stays
+    /// NULL noise, and `face_clusters` reports largest-first.
+    #[test]
+    fn recluster_groups_near_duplicates_and_leaves_noise() {
+        let _guard = test_lock();
+        let db = std::env::temp_dir().join("xreenshoty-recluster.db");
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+        std::env::set_var("XREENSHOTY_TEST_DB", &db);
+        with_conn(|_| Ok(())).unwrap();
+
+        let mk_hit = |seed: f32| crate::face::FaceHit {
+            box_xywh: [0.0, 0.0, 100.0, 100.0],
+            score: 0.9,
+            embedding: (0..crate::face::FACE_DIM)
+                .map(|i| (seed + i as f32 * 0.001).sin())
+                .collect(),
+        };
+        let id = with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO screenshots
+                     (path, created_at, width, height, source, ocr_boxes)
+                 VALUES ('/tmp/recluster.png', 1, 10, 10, 'capture', '[]')",
+                [],
+            )
+            .map_err(|e| format!("insert: {e}"))?;
+            Ok(conn.last_insert_rowid())
+        })
+        .unwrap();
+
+        // Two near-identical + one far outlier in a single screenshot row.
+        let mut far = mk_hit(50.0);
+        far.box_xywh = [200.0, 0.0, 100.0, 100.0];
+        set_faces(id, &[mk_hit(1.0), mk_hit(1.01), far], crate::face::FACE_MODEL).unwrap();
+
+        let written = recluster_faces().unwrap();
+        assert_eq!(written, 2, "the pair must cluster, the outlier must not");
+
+        let clusters = face_clusters().unwrap();
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].face_count, 2);
+        assert_eq!(clusters[0].screenshot_ids, vec![id]);
 
         for suffix in ["", "-wal", "-shm"] {
             std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
@@ -1906,5 +3390,252 @@ fn prune_removes_gone_rows_and_their_search_entries() {
             std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 7.5: build two two-face groups, rename one, merge them, and prove both
+    /// survive a recluster. This is the whole point of the cluster identity
+    /// tables — an id-scramble would silently detach the name, and an ordinary
+    /// merge would be undone by the next face batch.
+    #[test]
+    fn names_and_merges_survive_a_recluster() {
+        let _guard = test_lock();
+        let db = std::env::temp_dir().join("xreenshoty-cluster-identity.db");
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+        std::env::set_var("XREENSHOTY_TEST_DB", &db);
+        with_conn(|_| Ok(())).unwrap();
+
+        let basis = |i: usize, jitter: f32| -> Vec<f32> {
+            let mut v = vec![0.0f32; crate::face::FACE_DIM];
+            v[i] = 1.0;
+            v[(i + 1) % crate::face::FACE_DIM] = jitter;
+            v
+        };
+        let hit = |emb: Vec<f32>, x: f32| crate::face::FaceHit {
+            box_xywh: [x, 0.0, 100.0, 100.0],
+            score: 0.9,
+            embedding: emb,
+        };
+        let row = |path: &str| -> i64 {
+            with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO screenshots
+                         (path, created_at, width, height, source, ocr_boxes)
+                     VALUES (?1, 1, 200, 200, 'capture', '[]')",
+                    params![path],
+                )
+                .map_err(|e| format!("insert: {e}"))?;
+                Ok(conn.last_insert_rowid())
+            })
+            .unwrap()
+        };
+
+        let s1 = row("/tmp/identity-a.png");
+        let s2 = row("/tmp/identity-b.png");
+        // Person A: two near-identical faces. Person B: two faces orthogonal to A.
+        set_faces(
+            s1,
+            &[hit(basis(0, 0.0), 0.0), hit(basis(0, 0.001), 120.0)],
+            crate::face::FACE_MODEL,
+        )
+        .unwrap();
+        set_faces(
+            s2,
+            &[hit(basis(64, 0.0), 0.0), hit(basis(64, 0.001), 120.0)],
+            crate::face::FACE_MODEL,
+        )
+        .unwrap();
+
+        assert_eq!(recluster_faces().unwrap(), 4, "both pairs must cluster");
+        let clusters = face_clusters().unwrap();
+        assert_eq!(clusters.len(), 2);
+
+        let a = clusters
+            .iter()
+            .find(|c| c.screenshot_ids == vec![s1])
+            .expect("person A cluster")
+            .clone();
+        rename_cluster(a.cluster_id, Some("  Alice  ".into())).unwrap();
+
+        // A recluster must keep the name on the same person.
+        recluster_faces().unwrap();
+        let clusters = face_clusters().unwrap();
+        let a = clusters
+            .iter()
+            .find(|c| c.screenshot_ids == vec![s1])
+            .expect("person A cluster after recluster");
+        assert_eq!(a.label.as_deref(), Some("Alice"), "name must survive");
+        assert_eq!(a.face_count, 2);
+
+        // Merge B into A, then recluster: the link must hold them together.
+        let b = clusters
+            .iter()
+            .find(|c| c.screenshot_ids == vec![s2])
+            .expect("person B cluster");
+        let moved = merge_clusters(b.cluster_id, a.cluster_id).unwrap();
+        assert_eq!(moved, 2, "both faces must move");
+
+        recluster_faces().unwrap();
+        let clusters = face_clusters().unwrap();
+        assert_eq!(clusters.len(), 1, "the merge must survive a recluster");
+        assert_eq!(clusters[0].face_count, 4);
+        assert_eq!(clusters[0].label.as_deref(), Some("Alice"));
+        assert_eq!(clusters[0].screenshot_ids.len(), 2);
+
+        // Renaming to blank restores the placeholder.
+        rename_cluster(clusters[0].cluster_id, Some("   ".into())).unwrap();
+        let clusters = face_clusters().unwrap();
+        assert_eq!(clusters[0].label, None);
+
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+    }
+
+    /// 7.6: a face search seeded from one face ranks its own screenshot first
+    /// with similarity ~1, and collapses multiple faces per screenshot.
+    #[test]
+    fn search_by_face_ranks_the_seed_screenshot_first() {
+        let _guard = test_lock();
+        let db = std::env::temp_dir().join("xreenshoty-search-by-face.db");
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+        std::env::set_var("XREENSHOTY_TEST_DB", &db);
+        with_conn(|_| Ok(())).unwrap();
+
+        let basis = |i: usize| -> Vec<f32> {
+            let mut v = vec![0.0f32; crate::face::FACE_DIM];
+            v[i] = 1.0;
+            v
+        };
+        let row = |path: &str| -> i64 {
+            with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO screenshots
+                         (path, created_at, width, height, source, ocr_boxes)
+                     VALUES (?1, 1, 200, 200, 'capture', '[]')",
+                    params![path],
+                )
+                .map_err(|e| format!("insert: {e}"))?;
+                Ok(conn.last_insert_rowid())
+            })
+            .unwrap()
+        };
+        let face = |emb: Vec<f32>| crate::face::FaceHit {
+            box_xywh: [0.0, 0.0, 100.0, 100.0],
+            score: 0.9,
+            embedding: emb,
+        };
+
+        let s1 = row("/tmp/byname-a.png");
+        let s2 = row("/tmp/byname-b.png");
+        set_faces(s1, &[face(basis(0))], crate::face::FACE_MODEL).unwrap();
+        set_faces(s2, &[face(basis(64))], crate::face::FACE_MODEL).unwrap();
+
+        let seed: i64 = with_conn(|conn| {
+            conn.query_row(
+                "SELECT id FROM faces WHERE screenshot_id = ?1",
+                params![s1],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("seed: {e}"))
+        })
+        .unwrap();
+
+        let hits = search_by_face(seed, None).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits[0].path.ends_with("byname-a.png"),
+            "the seed's own screenshot must rank first, got {:?}",
+            hits[0].path
+        );
+        assert!(
+            hits[0].score.unwrap() > 0.999,
+            "identical vectors must read as cosine ~1, got {:?}",
+            hits[0].score
+        );
+        assert!(
+            hits[1].score.unwrap() < 0.01,
+            "orthogonal faces must read as cosine ~0, got {:?}",
+            hits[1].score
+        );
+
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+    }
+
+    /// The People progress bar is only honest if it separates "faces grouped"
+    /// from "faces seen once", and counts a *finished* pass — including one that
+    /// found nothing — as progress. Keying it off the face row count instead
+    /// would sit at zero forever on a face-free library.
+    #[test]
+    fn face_progress_separates_grouped_faces_from_pending_screenshots() {
+        let _guard = test_lock();
+        let db = std::env::temp_dir().join("xreenshoty-face-progress.db");
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
+        std::env::set_var("XREENSHOTY_TEST_DB", &db);
+        with_conn(|_| Ok(())).unwrap();
+
+        let basis = |i: usize, jitter: f32| -> Vec<f32> {
+            let mut v = vec![0.0f32; crate::face::FACE_DIM];
+            v[i] = 1.0;
+            v[(i + 1) % crate::face::FACE_DIM] = jitter;
+            v
+        };
+        let row = |path: &str| -> i64 {
+            with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO screenshots
+                         (path, created_at, width, height, source, ocr_boxes)
+                     VALUES (?1, 1, 200, 200, 'capture', '[]')",
+                    params![path],
+                )
+                .map_err(|e| format!("insert: {e}"))?;
+                Ok(conn.last_insert_rowid())
+            })
+            .unwrap()
+        };
+        let hit = |emb: Vec<f32>, x: f32| crate::face::FaceHit {
+            box_xywh: [x, 0.0, 100.0, 100.0],
+            score: 0.9,
+            embedding: emb,
+        };
+
+        let s1 = row("/tmp/progress-a.png");
+        let _s2 = row("/tmp/progress-b.png");
+        set_faces(
+            s1,
+            &[hit(basis(0, 0.0), 0.0), hit(basis(0, 0.001), 120.0)],
+            crate::face::FACE_MODEL,
+        )
+        .unwrap();
+
+        let before = face_progress().unwrap();
+        assert_eq!(before.screenshots_total, 2);
+        assert_eq!(
+            before.screenshots_indexed, 1,
+            "only the stamped screenshot counts as attempted"
+        );
+        assert_eq!(before.face_count, 2);
+        assert_eq!(before.clustered_faces, 0, "nothing clustered until we ask");
+
+        recluster_faces().unwrap();
+        let after = face_progress().unwrap();
+        assert_eq!(after.cluster_count, 1);
+        assert_eq!(after.clustered_faces, 2);
+        assert_eq!(after.face_count, 2);
+        assert_eq!(
+            after.screenshots_indexed, 1,
+            "clustering must not mark a screenshot's face pass done"
+        );
+
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::remove_file(format!("{}{suffix}", db.display())).ok();
+        }
     }
 }

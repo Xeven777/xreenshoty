@@ -9,6 +9,11 @@ export function dirOf(path: string) {
   return i > 0 ? path.slice(0, i) : path
 }
 
+/** `plural(1, "face")` → `1 face`, `plural(3, "face")` → `3 faces`. */
+export function plural(n: number, one: string, many = `${one}s`) {
+  return `${n} ${n === 1 ? one : many}`
+}
+
 /** Human-readable byte count for cache sizes. */
 export function formatBytes(bytes: number) {
   if (bytes <= 0) return "0 B"

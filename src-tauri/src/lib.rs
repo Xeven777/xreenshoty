@@ -3,7 +3,9 @@ use tauri_plugin_log::{Target, TargetKind};
 use tauri_plugin_opener::OpenerExt;
 
 pub mod db;
+mod cluster;
 mod embedder;
+mod face;
 mod indexer;
 mod ocr;
 mod region;
@@ -73,8 +75,15 @@ pub fn run() {
                 // log file became 100% ureq noise.
                 .level(log::LevelFilter::Info)
                 .filter(|metadata| {
-                    metadata.target().starts_with("tauri_native_lib")
-                        || metadata.target().starts_with("xreenshoty")
+                    let target = metadata.target();
+                    // `webview` is the target tauri-plugin-log assigns to records
+                    // emitted by the JS bindings. Leaving it out silently
+                    // dropped every frontend log — including the error-boundary
+                    // report, which is what makes a black window diagnosable.
+                    target.starts_with("tauri_native_lib")
+                        || target.starts_with("xreenshoty")
+                        || target == tauri_plugin_log::WEBVIEW_TARGET
+                        || target.starts_with(tauri_plugin_log::WEBVIEW_TARGET)
                 })
                 .targets([
                     Target::new(TargetKind::Stdout),
@@ -117,13 +126,24 @@ pub fn run() {
             db::search_similar,
             indexer::index_pause,
             indexer::index_status,
+            indexer::set_face_indexing,
             db::search_text,
             db::screenshot_detail,
             db::screenshot_count,
             watch::set_scan_folders,
             voice::voice_start,
             voice::voice_stop,
-            voice::voice_cancel
+            voice::voice_cancel,
+            face::face_status,
+            face::recluster_faces,
+            face::face_clusters,
+            face::rename_cluster,
+            face::merge_clusters,
+            face::forget_cluster,
+            face::cluster_screenshots,
+            face::search_by_face,
+            face::face_thumbnail,
+            ocr::ocr_status
         ])
         .on_page_load(|webview, payload| {
             if webview.label() == "main" && matches!(payload.event(), PageLoadEvent::Finished) {
