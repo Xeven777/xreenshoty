@@ -31,6 +31,7 @@ blocked on a fact nobody has checked yet.
 | Save folder / DB / logs | ✅ | ✅ portable already | ✅ portable already |
 | Global shortcuts | ✅ | 🟡 works, wrong convention | 🟡 works, wrong convention |
 | OCR | ✅ Indra OCR, 4 workers | 🟡 same code, needs the venv + models | 🟡 same code, needs the venv + models |
+| Face indexing (People) | ✅ opt-in, ONNX on CPU | 🟡 same code, needs the venv + 2 ONNX files | 🟡 same code, needs the venv + 2 ONNX files |
 | Image embeddings | ✅ Arc on Vulkan | ❌ hardcoded Linux path | ❌ hardcoded + no Metal path |
 | Voice input | ✅ pw-record | ❌ no binary exists | ❌ no binary exists |
 | Search / DB / indexer | ✅ | ✅ pure Rust + SQLite | ✅ pure Rust + SQLite |

@@ -4,8 +4,9 @@
 Local-first screenshot capture and later retrieval, fully offline. Match XFCE
 Screenshot behaviour for capture first; only then add local models for search.
 
-Status: Milestones 1–4, 5.0-5.6 and 6.1-6.3 implemented. Remaining:
-6.4 answer synthesis, 6.5 rerank if needed, 7.x face grouping.
+Status: Milestones 1–4, 5.0-5.6, 6.1-6.3 and 7.0-7.6 (opt-in face indexing,
+People view, search-by-person) implemented. Remaining: 6.4 answer synthesis,
+6.5 rerank if needed.
 
 ## Stack
 

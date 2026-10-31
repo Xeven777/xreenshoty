@@ -455,6 +455,19 @@ already `tsc -b` — do not "simplify" it back to `--noEmit`.
   `search_by_face_ranks_the_seed_screenshot_first`. `l2_to_cosine` now only
   interprets legacy L2 tables. Ranking was never affected (the transform is
   monotonic), only the displayed/absolute number.
+- **`DEFAULT_EPS` is 0.55, and `recluster_faces` returns faces, not clusters.**
+  Raised from 0.5 on 2026-11-01 once the corpus reached 375 faces: 50 clusters /
+  280 clustered faces / 95 singletons, against 54 / 267 / 108 at 0.5. 0.6 is the
+  measured over-merge point here, so do not raise it further without labelled
+  pairs. `db::recluster_faces` returns the **number of face rows written into a
+  cluster** (280), not the cluster count (50) — that is why the toast reads
+  "N faces in M people". `./scripts/setup-face.sh` creates the `face-env` venv
+  and fetches both ONNX files; `face_status` reports which of venv/script/models
+  is missing. It takes no venv override on purpose — `face.rs` looks only at
+  `<data-local>/xreenshoty/face-env/bin/python`, so an install elsewhere would
+  succeed and then be invisible to the app.
+  Reclustering is a pure DB function, so a one-off `src/bin` can run it without
+  the window; `dbcheck` is read-only by design.
 - **Cluster ids must be stable across reclusters, or names and merges die.**
   `cluster()` returns positional labels that scramble every run. `recluster_faces`
   therefore maps each new group onto the previous `cluster_id` it overlaps most
