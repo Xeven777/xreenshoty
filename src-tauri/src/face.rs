@@ -250,12 +250,23 @@ pub fn models_present() -> bool {
 }
 
 /// Readiness probe for the UI: venv + script + models, so Settings can say
-/// exactly which piece is missing instead of a bare on/off.
+/// exactly which piece is missing instead of a bare on/off. The counts are what
+/// the People view's progress bar and summary are built from.
 #[derive(serde::Serialize)]
 pub struct FaceStatus {
     pub venv_ready: bool,
     pub models_present: bool,
     pub face_count: i64,
+    /// Faces sitting in a cluster. Below `face_count`: the difference is faces
+    /// seen once, or too small to index, which are deliberately ungrouped.
+    pub clustered_faces: i64,
+    /// People currently listed.
+    pub cluster_count: i64,
+    /// Screenshots whose face pass has finished. Keyed off `face_indexed_at`,
+    /// which records "attempted" the same way `ocr_boxes` does, so a
+    /// face-free screenshot counts as done rather than pending forever.
+    pub screenshots_indexed: i64,
+    pub screenshots_total: i64,
 }
 
 #[tauri::command]
@@ -264,10 +275,15 @@ pub async fn face_status() -> Result<FaceStatus, String> {
 }
 
 fn face_status_blocking() -> Result<FaceStatus, String> {
+    let progress = crate::db::face_progress()?;
     Ok(FaceStatus {
         venv_ready: venv_ready(),
         models_present: models_present(),
-        face_count: crate::db::face_count().unwrap_or(0),
+        face_count: progress.face_count,
+        clustered_faces: progress.clustered_faces,
+        cluster_count: progress.cluster_count,
+        screenshots_indexed: progress.screenshots_indexed,
+        screenshots_total: progress.screenshots_total,
     })
 }
 
@@ -282,6 +298,113 @@ pub async fn recluster_faces() -> Result<usize, String> {
 #[tauri::command]
 pub async fn face_clusters() -> Result<Vec<crate::db::FaceCluster>, String> {
     crate::screenshot::offload(crate::db::face_clusters).await
+}
+
+/// Give a cluster a user-visible name (M7.5). An empty label clears it.
+#[tauri::command]
+pub async fn rename_cluster(cluster_id: i64, label: Option<String>) -> Result<(), String> {
+    crate::screenshot::offload(move || crate::db::rename_cluster(cluster_id, label)).await
+}
+
+/// Merge `from` into `into`. Durable: recorded as a same-person link that every
+/// later recluster re-applies (M7.5).
+#[tauri::command]
+pub async fn merge_clusters(from: i64, into: i64) -> Result<usize, String> {
+    log::info!("face: merge_clusters from={from} into={into}");
+    let moved = crate::screenshot::offload(move || crate::db::merge_clusters(from, into)).await?;
+    log::info!("face: merged {moved} face(s) from {from} into {into}");
+    Ok(moved)
+}
+
+/// Forget a person: remove their faces from the index. The screenshots stay,
+/// and so does their `face_indexed_at` stamp, so the deleted person is not
+/// re-detected on the next pass.
+#[tauri::command]
+pub async fn forget_cluster(cluster_id: i64) -> Result<usize, String> {
+    log::info!("face: forget_cluster {cluster_id}");
+    let removed =
+        crate::screenshot::offload(move || crate::db::forget_cluster(cluster_id)).await?;
+    log::info!("face: forgot {removed} face(s) from cluster {cluster_id}");
+    Ok(removed)
+}
+
+/// One person's screenshots, newest first — the click-through grid.
+#[tauri::command]
+pub async fn cluster_screenshots(cluster_id: i64) -> Result<Vec<crate::db::Screenshot>, String> {
+    crate::screenshot::offload(move || crate::db::cluster_screenshots(cluster_id)).await
+}
+
+/// 7.6: screenshots whose faces are closest to a reference face.
+#[tauri::command]
+pub async fn search_by_face(
+    face_id: i64,
+    limit: Option<u32>,
+) -> Result<Vec<crate::db::SearchHit>, String> {
+    crate::screenshot::offload(move || crate::db::search_by_face(face_id, limit)).await
+}
+
+/// Cropped face tile as a data URL, for the People grid. Cropped in Rust so it
+/// works for any save folder without asset-protocol scope, exactly like
+/// `thumbnail`. Cached on disk in the same directory Settings clears.
+#[tauri::command]
+pub async fn face_thumbnail(face_id: i64, size: Option<u32>) -> Result<String, String> {
+    crate::screenshot::offload(move || face_thumbnail_blocking(face_id, size)).await
+}
+
+fn face_thumbnail_blocking(face_id: i64, size: Option<u32>) -> Result<String, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let size = size.unwrap_or(160).clamp(32, 512);
+    let (path, [x, y, w, h]) = crate::db::face_box(face_id)?;
+    let src = PathBuf::from(&path);
+
+    let cache = crate::screenshot::face_cache_file(&src, &[x, y, w, h], size);
+    if let Some(cached) = &cache {
+        if let Ok(bytes) = std::fs::read(cached) {
+            if !bytes.is_empty() {
+                return Ok(format!(
+                    "data:image/png;base64,{}",
+                    STANDARD.encode(&bytes)
+                ));
+            }
+        }
+    }
+
+    let img = screenshots::image::open(&src).map_err(|e| format!("Open failed: {e}"))?;
+    let (cx, cy, cw, ch) = crop_rect(img.width(), img.height(), [x, y, w, h]);
+    let tile = img.crop_imm(cx, cy, cw, ch).thumbnail(size, size);
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    tile.write_to(&mut buf, screenshots::image::ImageFormat::Png)
+        .map_err(|e| format!("Encode failed: {e}"))?;
+    let png = buf.into_inner();
+
+    if let Some(cached) = &cache {
+        if let Some(parent) = cached.parent() {
+            let _ = std::fs::create_dir_all(parent);
+            let _ = std::fs::write(cached, &png);
+        }
+    }
+
+    Ok(format!("data:image/png;base64,{}", STANDARD.encode(&png)))
+}
+
+/// Crop rectangle for a face tile: the detector box padded ~15% so the tile
+/// frames the head instead of cropping to the jaw, clamped inside the image so
+/// a face at an edge — or a box that runs slightly off-screen — cannot overrun
+/// it. Pure, so the geometry is testable without decoding or caching anything.
+fn crop_rect(
+    img_w: u32,
+    img_h: u32,
+    [x, y, w, h]: [f32; 4],
+) -> (u32, u32, u32, u32) {
+    let pad_x = w * 0.15;
+    let pad_y = h * 0.15;
+    let cx = (x - pad_x).max(0.0);
+    let cy = (y - pad_y).max(0.0);
+    let cw = (w + 2.0 * pad_x).min(img_w as f32 - cx).max(1.0);
+    let ch = (h + 2.0 * pad_y).min(img_h as f32 - cy).max(1.0);
+    (cx as u32, cy as u32, cw as u32, ch as u32)
 }
 
 #[cfg(test)]
@@ -307,9 +430,33 @@ mod tests {
         }
     }
 
+    /// The crop is padded, and — the part that actually bites — always stays
+    /// inside the image. A detector box can run off an edge, and `crop_imm`
+    /// panics rather than clipping, which would take down a People grid over
+    /// one face in a corner.
     #[test]
-    fn batch_output_rejects_wrong_dims_and_small_boxes() {
-        let emb128: Vec<f32> = (0..128).map(|i| i as f32 / 128.0).collect();
+    fn crop_rect_pads_and_stays_inside_the_image() {
+        let (x, y, w, h) = crop_rect(1000, 1000, [400.0, 400.0, 100.0, 100.0]);
+        assert_eq!((x, y, w, h), (385, 385, 130, 130), "padded by 15%");
+
+        // Bottom-right corner: the padded box must not overrun the image.
+        let (x, y, w, h) = crop_rect(200, 150, [180.0, 140.0, 40.0, 40.0]);
+        assert!(x + w <= 200, "{x}+{w} overflows 200");
+        assert!(y + h <= 150, "{y}+{h} overflows 150");
+        assert!(w > 0 && h > 0, "crop must keep a non-zero area");
+
+        // Box partly off-screen: origin clamps to 0, size never goes negative.
+        let (x, y, w, h) = crop_rect(200, 150, [-30.0, -10.0, 60.0, 60.0]);
+        assert_eq!((x, y), (0, 0), "origin must clamp to the image");
+        assert!(w > 0 && h > 0);
+
+        // Degenerate box still yields a drawable rect.
+        let (_, _, w, h) = crop_rect(200, 150, [10.0, 10.0, 0.0, 0.0]);
+        assert!(w >= 1 && h >= 1, "w={w} h={h}");
+    }
+
+    #[test]
+    fn batch_output_rejects_wrong_dims_and_small_boxes() {        let emb128: Vec<f32> = (0..128).map(|i| i as f32 / 128.0).collect();
         let parsed: BatchOutput = serde_json::from_value(serde_json::json!({
             "ok": true,
             "results": [

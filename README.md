@@ -24,7 +24,7 @@
   </p>
   <p>
     <img src="https://img.shields.io/badge/search-FTS5%20%2B%20sqlite--vec%20cosine-FFA500?style=flat-square&logo=sqlite&logoColor=white" alt="SQLite FTS5 + sqlite-vec" />
-    <img src="https://img.shields.io/badge/OCR-tesseract%205.5-CC0000?style=flat-square" alt="tesseract 5.5" />
+    <img src="https://img.shields.io/badge/OCR-Indra%20OCR%201.1.2-CC0000?style=flat-square" alt="Indra OCR 1.1.2" />
     <img src="https://img.shields.io/badge/embeddings-EmbeddingGemma%202%20%C2%B7%20768--d-B68A36?style=flat-square" alt="EmbeddingGemma 2 768-d" />
     <img src="https://img.shields.io/badge/GPU-Vulkan%20%2B%20llama--server-B71C1C?style=flat-square&logo=vulkan&logoColor=white" alt="Vulkan + llama-server" />
     <img src="https://img.shields.io/badge/voice-Whistle%20local%20STT-E0483E?style=flat-square" alt="Whistle local speech-to-text" />
@@ -46,7 +46,7 @@ Why xreenshoty hits different ✨
 
 🧠 **Understands pixels, not just words** every screenshot gets a 768-d EmbeddingGemma 2 vector on your own GPU. Near-duplicates taken 13 seconds apart score 0.997. Totally different screens drop to 0.57. It knows the difference.
 
-🔒 **Offline to the bone** tesseract, llama-server, SQLite, and sqlite-vec all run on your box. No cloud, no account, no telemetry, no "sign in to continue". Pull the network cable and everything still works.
+🔒 **Offline to the bone** Indra OCR, llama-server, SQLite, and sqlite-vec all run on your box. No cloud, no account, no telemetry, no "sign in to continue". Pull the network cable and everything still works.
 
 🗂️ **Your files stay yours** images live in your save folder, the DB is metadata only. Delete the DB and the indexer rebuilds it from the images. A database bug can never eat a screenshot.
 
@@ -109,7 +109,7 @@ flowchart LR
 
     subgraph BG["⚙️ Background worker — capture never waits"]
         direction TB
-        OCR["🔤 tesseract 5.5 OCR<br/>4 workers · text + boxes"]
+        OCR["🔤 Indra OCR 1.1.2<br/>4 workers · text + boxes"]
         EMB["🎮 llama-server · /v1/embeddings<br/>EmbeddingGemma 2 · 768-d · Vulkan"]
         TX["One transaction<br/>FTS5 rows + vec0 rows"]
         OCR --> EMB --> TX
@@ -152,7 +152,7 @@ flowchart LR
     class OUT out
 ```
 
-Capture funnels through one function. Every mode calls `save_png`, which writes the row and pokes the worker. The worker OCRs with tesseract, embeds with EmbeddingGemma 2 over local HTTP, and writes FTS5 rows plus vec0 rows in one transaction. Watched folders skip capture entirely: inotify fires once a folder goes quiet, and `import_existing` writes the same row shape, so a screenshot pasted in from another app is searchable too.
+Capture funnels through one function. Every mode calls `save_png`, which writes the row and pokes the worker. The worker OCRs with Indra OCR in an isolated venv, embeds with EmbeddingGemma 2 over local HTTP, and writes FTS5 rows plus vec0 rows in one transaction. Watched folders skip capture entirely: inotify fires once a folder goes quiet, and `import_existing` writes the same row shape, so a screenshot pasted in from another app is searchable too.
 
 Search runs two arms and fuses them. BM25 scans OCR text. k-NN scans image vectors with cosine distance. Each arm rescales with min-max, then blends 0.44 text and 0.56 visual. A doc missing from one arm takes that arm floor value, so text-free screenshots stay findable. Scores print as one number. The bar and the label read from the same value.
 
@@ -168,7 +168,8 @@ Real timings from the dev box, Intel Arc A530M plus UHD 770 iGPU, 370 screenshot
 | Text-free shots             | 74 of 370 have empty OCR text and rely on visual search                                                                           |
 | Embed speed, dGPU vs iGPU   | 1.2 s per image on Arc A530M, 17.2 s on UHD 770                                                                                   |
 | Vision token cap            | Full 924 tokens takes 9.25 s. Cap 320 takes 1.43 s and keeps top 1 on 6 of 6 test shots. Cap 128 takes 0.47 s but drops to 5 of 6 |
-| OCR parallelism             | 4 tesseract workers cut 12 core time from 0.95 s to 0.50 s per image                                                              |
+| OCR engine and speed        | Indra OCR, 4 worker processes: 0.136 s per image, against tesseract's 0.50 s at the same 4 cores                                               |
+| OCR accuracy                | Over 34 real screenshots Indra found 2149 unique words to tesseract's 1604, and read "GO TO ASSESSMENT" where tesseract read "GO TO ASSESSME!" |
 | Task prefix for text embeds | With prefix, related pairs score 0.831 and unrelated score 0.693. Without it the gap almost closes                                |
 | Fusion weights              | 0.44 OCR and 0.56 visual, set by preference. No relevance labels yet                                                              |
 
@@ -186,12 +187,12 @@ No toy stack — every piece runs on your box and pulls its weight.
 | Thumbnails     | Rust, streamed as base64              | Disk cache + memory pool, size shown and clearable in Settings |
 | Metadata       | rusqlite with bundled SQLite          | Single file, idempotent schema                              |
 | Keyword search | FTS5                                  | Terms are split and quoted so operators cannot break syntax |
-| OCR            | tesseract 5.5.0, 4 workers            | CPU only, starts in milliseconds                            |
+| OCR            | Indra OCR 1.1.2, ONNX, 4 workers      | CPU only, 80+ languages, isolated venv, line boxes            |
 | Embeddings     | EmbeddingGemma 2 through llama-server | 768-d, Vulkan backend, mean pooling, auto GPU pick          |
 | Vectors        | sqlite-vec vec0 with cosine metric    | Text and vectors live in one transaction                    |
 | Voice          | Whistle 16.9 MB via cactus-needle     | Push to talk, isolated venv, milestone 6 only               |
 
-No Python in the main path. Rust talks HTTP to localhost for embeddings. Voice shells out to a venv only when you press the mic.
+No Python in the main path. Rust talks HTTP to localhost for embeddings. Voice shells out to a venv only when you press the mic, and OCR shells out to its own venv in the background worker.
 
 ## 🖥️ Platform support
 
@@ -209,7 +210,7 @@ System packages.
 - 🐧 Linux with X11, XFCE tested (`echo $XDG_SESSION_TYPE` should print `x11`)
 - 🦀 Rust stable toolchain + Cargo (Tauri 2 backend, `cargo check` must pass)
 - 🟢 Bun (frontend package manager, `bun install` then `bun run tauri dev`)
-- 🔤 tesseract 5 with `eng` data (`tesseract --version`, `eng.traineddata` present)
+- 🐍 Python 3.10+ and `uv` for the OCR runtime — `./scripts/setup-ocr.sh` creates the `ocr-env` venv and downloads 73 MB of models into `~/apps/models/indra-ocr`
 - 🎮 Vulkan drivers + `vulkaninfo` (GPU auto-pick needs it, Intel Arc A530M tested on Mesa 25.0.7)
 - 🎤 `pw-record` or `arecord` for voice input, `xdg-open` for opening images
 
@@ -218,6 +219,7 @@ Models (all local, all yours).
 - `embeddinggemma-2-Q8_0.gguf`, text plus image embedding model with 768-d output
 - `mmproj-embeddinggemma-2-Q8_0.gguf`, vision projector required for image vectors
 - 🦙 llama-server binary **b11541 or newer**. Older builds lack the EmbeddingGemma 2 arch and fail with `unknown model architecture`. Must start with `--embeddings`
+- 🔤 Indra OCR models in `~/apps/models/indra-ocr` (73 MB, downloaded by `scripts/setup-ocr.sh`)
 - Optional for answer synthesis (next milestone): `gemma3:1b` or `LFM2.5-1.2B` in Ollama, zero new downloads
 
 ## 🚀 Quickstart
@@ -226,8 +228,13 @@ Run it.
 
 ```bash
 bun install
+./scripts/setup-ocr.sh   # once: the ocr-env venv + the Indra OCR models
 bun run tauri dev
 ```
+
+`setup-ocr.sh` is idempotent and safe to re-run. Without it the app still
+captures and searches by image, but new screenshots get no text — Settings →
+Text recognition says which piece is missing.
 
 Check it.
 
@@ -257,6 +264,10 @@ XREENSHOTY_IMAGE_MAX_TOKENS=320  # vision token cap
 XREENSHOTY_FUSION_WEIGHTS="0.44,0.56"
 XREENSHOTY_FUSION=rrf            # try RRF fusion instead of weighted
 XREENSHOTY_TEST_DB=/tmp/test.db  # keep tests off your real index
+
+XREENSHOTY_OCR_CORES=4            # OCR worker processes
+XREENSHOTY_OCR_MODELS=~/apps/models/indra-ocr
+XREENSHOTY_OCR_TIMEOUT_SECS=300  # per batch
 ```
 
 ## Project status

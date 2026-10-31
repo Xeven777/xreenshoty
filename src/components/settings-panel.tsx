@@ -10,6 +10,7 @@ import {
   Minus,
   Plus,
   Smiley,
+  TextT,
   Trash,
   Warning,
   X,
@@ -24,13 +25,15 @@ import {
   faceStatus,
   getDefaultSaveDir,
   openFolderSafe,
-  setFaceIndexing,
+  ocrStatus,
   setScanFolders,
   thumbnailCacheSize,
   type FaceStatus,
+  type OcrStatus,
 } from "@/lib/screenshot"
 import { eventToAccelerator, prettyAccelerator } from "@/lib/shortcuts"
 import { clearMemoryCaches } from "@/lib/use-thumbnails"
+import { clearFaceThumbnailCache } from "@/lib/use-face-thumbnails"
 import { toastCacheCleared, toastFailed, toast } from "@/lib/toast"
 import { formatBytes } from "@/lib/utils"
 export function SettingsPanel({
@@ -50,6 +53,7 @@ export function SettingsPanel({
   const [clearing, setClearing] = useState(false)
   const [newFolder, setNewFolder] = useState("")
   const [face, setFace] = useState<FaceStatus | null>(null)
+  const [ocr, setOcr] = useState<OcrStatus | null>(null)
 
   // The cache size is only read when the tab is mounted, so the number stays
   // honest for as long as Settings is open.
@@ -73,6 +77,7 @@ export function SettingsPanel({
       // The in-memory pools must go too, or the grids keep serving what they
       // already have and the clear looks like a no-op.
       clearMemoryCaches()
+      clearFaceThumbnailCache()
       setCacheBytes(0)
       toastCacheCleared(freed)
     } catch (error) {
@@ -122,17 +127,30 @@ export function SettingsPanel({
     void applyScanFolders(scanFolders.filter((d) => d !== dir))
   }
 
-  // Push the face opt-in to Rust on load and on every change: Rust holds no
-  // settings state, so without this the toggle would be UI-only. The same
-  // first-call-landing rule as `set_scan_folders` applies.
+  // The face opt-in itself is pushed from `App`, which is always mounted —
+  // pushing it from here only worked if this tab happened to be open. The
+  // readiness readout still refreshes when the toggle flips.
   useEffect(() => {
     if (!tauri) return
-    void setFaceIndexing(settings.faceIndexing).catch(() => undefined)
-    // Refresh the readiness readout whenever the toggle flips.
     void faceStatus()
       .then((s) => setFace(s))
       .catch(() => undefined)
   }, [tauri, settings.faceIndexing])
+
+  // The OCR readiness is read once: nothing here changes it, and the missing
+  // piece has to be visible rather than silently disabling text search.
+  useEffect(() => {
+    if (!tauri) return
+    let cancelled = false
+    void ocrStatus()
+      .then((s) => {
+        if (!cancelled) setOcr(s)
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [tauri])
 
   // The banner lives in this tab only; a toast reaches the user wherever they
   // are when the bind fails (usually triggered from Capture).
@@ -334,6 +352,36 @@ export function SettingsPanel({
         {!tauri ? (
           <Badge variant="secondary">Needs the desktop shell</Badge>
         ) : null}
+      </section>
+
+      <section className="space-y-4 rounded-2xl border bg-card p-5 shadow-sm">
+        <header className="flex items-center gap-2.5">
+          <TextT size={18} className="text-muted-foreground" />
+          <div>
+            <h2 className="font-medium">Text recognition</h2>
+            <p className="text-xs text-muted-foreground">
+              Reads the text out of new screenshots so they can be searched.
+            </p>
+          </div>
+        </header>
+        <div className="flex items-center justify-between gap-4">
+          <span className="text-sm">
+            {ocr
+              ? ocr.venv_ready && ocr.models_present
+                ? "Ready"
+                : "Not installed"
+              : "—"}
+          </span>
+          <Badge variant="secondary">{ocr?.engine ?? "OCR"}</Badge>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Runs on this machine and never leaves it. Needs the ocr-env venv and
+          the model files under ~/apps/models/indra-ocr — run
+          scripts/setup-ocr.sh once.
+          {ocr
+            ? ` venv ${ocr.venv_ready ? "ready" : "missing"} · models ${ocr.models_present ? "present" : "missing"}.`
+            : ""}
+        </p>
       </section>
 
       <section className="space-y-4 rounded-2xl border bg-card p-5 shadow-sm">

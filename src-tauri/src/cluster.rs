@@ -6,8 +6,6 @@
 //! mega-blob failures), an `eps` measured on this corpus, and singletons
 //! left unassigned as noise rather than forced into a group.
 
-use serde::Serialize;
-
 /// Elevation above which a face is not grouped with anyone. Cosine *distance*
 /// (`1 - similarity`), measured on this machine's real corpus — see plan.md 7.4.
 pub fn eps() -> f32 {
@@ -20,14 +18,6 @@ pub fn eps() -> f32 {
 /// Clusters below this size are noise: one person seen once cannot be told
 /// apart from a near-duplicate or an outlier, so nothing is claimed.
 pub const MIN_CLUSTER: usize = 2;
-
-/// Assignment for one face: cluster id, or `None` for unassigned noise.
-/// Cluster ids are dense, assigned largest-first for a stable order.
-#[derive(Debug, Clone, Serialize)]
-pub struct Assignment {
-    pub face_id: i64,
-    pub cluster: Option<i64>,
-}
 
 /// Cosine distance between two L2-normalised vectors. Inputs must already be
 /// normalised — `cluster` does that, callers do not.
@@ -184,6 +174,9 @@ mod tests {
 }
 
 /// Measured on this machine's real corpus — see plan.md 7.4.
-/// eps=0.5: 13 clusters / 43 faces / 26 singletons; the reference identity
-/// stays stable 0.4→0.52 and over-merges at 0.6.
-pub const DEFAULT_EPS: f32 = 0.5;
+/// At eps=0.5: 13 clusters / 43 faces / 26 singletons; the reference identity
+/// stays stable 0.4→0.52 and over-merges at 0.6. Raised to 0.55 to pull the
+/// singleton tail in while staying clear of the measured 0.6 over-merge point:
+/// on 375 faces that gave 50 clusters / 280 clustered / 95 singletons, against
+/// 54 / 267 / 108 at 0.5 — a modest pull, not a collapse.
+pub const DEFAULT_EPS: f32 = 0.55;

@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 /// Whether to immediately start the next batch.
 ///
 /// Must key off work *done*, never the row count. A full batch of rows that
@@ -7,6 +5,17 @@ use std::path::PathBuf;
 /// query, so chaining on row count spins the worker against the DB.
 fn should_chain(processed: usize, rows_were_full: bool, batch: usize) -> bool {
     processed >= batch && rows_were_full
+}
+
+/// Whether the face geometry changed enough to be worth regrouping.
+///
+/// A recluster rewrites `cluster_id` for every face and reconciles the name
+/// rows, so running it after a pass that stored nothing -- every screenshot was
+/// face-free, or every store failed -- is pure churn. It also logged
+/// "reclustered N faces" after a batch that wrote nothing, which reads as
+/// progress and hides the failure directly above it.
+fn should_recluster(faces_stored: usize) -> bool {
+    faces_stored > 0
 }
 
 use std::sync::atomic::Ordering;
@@ -35,9 +44,36 @@ const IDLE_POLL: Duration = Duration::from_secs(20);
 const PAUSE_POLL: Duration = Duration::from_millis(400);
 /// Rows handled per pass.
 const BATCH: u32 = 25;
-/// Concurrent tesseract subprocesses. Each is CPU-bound and we have 12 cores,
-/// but leaving most of them free keeps the desktop responsive.
-const OCR_PARALLEL: usize = 4;
+
+/// How long OCR stays out of the way after a batch failed for environmental
+/// reasons.
+///
+/// The failed rows are left unstamped, so a fixed environment picks them up
+/// later -- but they sort first, and re-offering them every poll would pin
+/// them at the head of the queue and starve the embedding pass for good. A
+/// short backoff lets the rest of the library catch up first.
+static OCR_BACKOFF_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+const OCR_BACKOFF: Duration = Duration::from_secs(300);
+
+fn millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Whether the OCR stage can run this pass.
+///
+/// False when the environment is not installed, and false for a while after a
+/// batch failed. The rows that owe text are then not offered at all, so they
+/// cannot sit at the head of the queue and starve the embedding pass.
+fn ocr_available() -> bool {
+    if !ocr::env_ready() {
+        return false;
+    }
+    millis_now() >= OCR_BACKOFF_UNTIL.load(Ordering::Relaxed)
+}
 
 /// Set once at startup so `save_png` can nudge the worker without every
 /// capture command having to take an `AppHandle` parameter it would only
@@ -48,13 +84,6 @@ static INDEXER: std::sync::OnceLock<Arc<Indexer>> = std::sync::OnceLock::new();
 
 fn indexer() -> Option<Arc<Indexer>> {
     INDEXER.get().cloned()
-}
-
-/// Install an embedder for tests. The real one is created by `Indexer::start`
-/// when the app boots, which a unit test never does.
-#[cfg(test)]
-pub fn install_test_embedder(e: Arc<Embedder>) {
-    let _ = EMBEDDER.set(e);
 }
 
 /// The embedder owned by the running indexer, so search commands can reach it
@@ -227,7 +256,11 @@ impl Indexer {
             // through `set_face_indexing` (same shape as `set_scan_folders`).
             // `None` means `pending()` offers no face work at all.
             let face_label = face_indexing_enabled().then_some(face::FACE_MODEL);
-            let rows = match db::pending(BATCH, &label, face_label) {
+            // OCR work is only offered when it can actually run: a row that
+            // owes text sorts first, so offering rows the environment cannot
+            // handle would starve the embedding pass for good.
+            let ocr_ready = ocr_available();
+            let rows = match db::pending(BATCH, &label, ocr_ready, face_label) {
                 Ok(rows) => rows,
                 Err(e) => {
                     log::warn!("indexer: could not read pending work: {e}");
@@ -252,59 +285,63 @@ impl Indexer {
             // embedded in the same pass, and reporting both as "2" read as if
             // two images had been handled.
             let mut touched: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            let mut faces_stored: usize = 0;
             let _ = &app;
 
-            // --- OCR: tesseract is a subprocess, so these run concurrently. ---
+            // --- OCR: one subprocess for the whole batch, Indra OCR. ---
+            // The engine loads its models once and reads the batch itself, so
+            // a pass costs one interpreter start, not one per screenshot.
             let ocr_rows: Vec<_> = rows.iter().filter(|r| r.needs_ocr).collect();
-            for chunk in ocr_rows.chunks(OCR_PARALLEL) {
-                let results: Vec<Result<ocr::OcrResult, String>> = std::thread::scope(|scope| {
-                    let handles: Vec<_> = chunk
-                        .iter()
-                        .map(|row| {
-                            let path = PathBuf::from(&row.path);
-                            scope.spawn(move || ocr::run(&path))
-                        })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| {
-                            h.join()
-                                .unwrap_or_else(|_| Err("OCR thread panicked".into()))
-                        })
-                        .collect()
-                });
-
-                for (row, outcome) in chunk.iter().zip(results) {
-                    match outcome {
-                        Ok(result) => {
-                            let words = serde_json::to_string(&result.words)
-                                .unwrap_or_else(|_| "[]".into());
-                            match db::set_ocr(row.id, &result.text, &words) {
-                                // Any successful `set_ocr` is progress, including
-                                // the empty-text case: `ocr_boxes` is written
-                                // either way, so the row will not be offered
-                                // again. Counting only non-empty text meant a
-                                // batch of text-free screenshots reported no
-                                // progress and stalled the chain.
-                                Ok(()) => {
-                                    touched.insert(row.id);
+            if !ocr_rows.is_empty() {
+                let paths: Vec<String> = ocr_rows.iter().map(|r| r.path.clone()).collect();
+                match ocr::run_batch(&paths) {
+                    Ok(results) => {
+                        for (row, outcome) in ocr_rows.iter().zip(results) {
+                            match outcome {
+                                Ok(result) => {
+                                    let words = serde_json::to_string(&result.words)
+                                        .unwrap_or_else(|_| "[]".into());
+                                    match db::set_ocr(row.id, &result.text, &words) {
+                                        // Any successful `set_ocr` is progress,
+                                        // including the empty-text case:
+                                        // `ocr_boxes` is written either way, so
+                                        // the row will not be offered again.
+                                        // Counting only non-empty text meant a
+                                        // batch of text-free screenshots
+                                        // reported no progress and stalled the
+                                        // chain.
+                                        Ok(()) => {
+                                            touched.insert(row.id);
+                                        }
+                                        Err(e) => log::warn!(
+                                            "indexer: storing OCR for {} failed: {e}",
+                                            row.path
+                                        ),
+                                    }
                                 }
                                 Err(e) => {
-                                    log::warn!("indexer: storing OCR for {} failed: {e}", row.path)
+                                    log::warn!("indexer: OCR failed for {}: {e}", row.path);
+                                    // Mark attempted even on failure. `pending()`
+                                    // keys off `ocr_boxes`, so leaving it NULL
+                                    // would re-OCR a hopeless image forever --
+                                    // paying the full timeout again on every
+                                    // idle poll, which is the stall this is
+                                    // guarding against.
+                                    let _ = db::set_ocr(row.id, "", "[]");
                                 }
                             }
                         }
-                        Err(e) => {
-                            log::warn!("indexer: OCR failed for {}: {e}", row.path);
-                            // Mark attempted even on failure. `pending()` keys
-                            // off `ocr_boxes`, so leaving it NULL would re-OCR a
-                            // hopeless image forever — paying the full timeout
-                            // again on every idle poll, which is the stall this
-                            // is guarding against. A timed-out screenshot does
-                            // lose its text; the timeout is set well above the
-                            // real cost precisely so that stays rare.
-                            let _ = db::set_ocr(row.id, "", "[]");
-                        }
+                    }
+                    Err(e) => {
+                        // A batch-level failure is environmental, not per-row:
+                        // log once, leave the rows unstamped so a fixed
+                        // environment picks them up, and back off so they do
+                        // not pin the head of the queue.
+                        log::warn!("indexer: OCR batch failed: {e}");
+                        OCR_BACKOFF_UNTIL.store(
+                            millis_now() + OCR_BACKOFF.as_millis() as u64,
+                            Ordering::Relaxed,
+                        );
                     }
                 }
             }
@@ -364,12 +401,15 @@ impl Indexer {
                 if face::venv_ready() && face::models_present() {
                     let paths: Vec<String> =
                         to_face.iter().map(|r| r.path.clone()).collect();
-                    match face::extract(&paths) {
-                        Ok(all) => {
+                    // A pass over a large library takes a while; say so, so the
+                    // log distinguishes "running" from "wedged".
+                    log::info!("indexer: face pass over {} screenshot(s)", paths.len());
+                    match face::extract(&paths) {                        Ok(all) => {
                             for (row, hits) in to_face.iter().zip(all.iter()) {
                                 match db::set_faces(row.id, hits, face::FACE_MODEL) {
                                     Ok(()) => {
                                         touched.insert(row.id);
+                                        faces_stored += 1;
                                         if !hits.is_empty() {
                                             log::info!(
                                                 "indexer: {} face(s) in {}",
@@ -392,13 +432,31 @@ impl Indexer {
                             log::warn!("indexer: face batch failed: {e}");
                         }
                     }
-                    // New faces change the geometry: recluster once per batch,
-                    // not per row. Cheap (millisecond-scale) and idempotent.
-                    if let Err(e) = self.recluster_quietly() {
-                        log::warn!("indexer: recluster failed: {e}");
+                    // New faces change the geometry: recluster once per batch
+                    // that actually stored one, not per row. Cheap and
+                    // idempotent, but pointless after a pass that wrote nothing.
+                    if should_recluster(faces_stored) {
+                        if let Err(e) = self.recluster_quietly() {
+                            log::warn!("indexer: recluster failed: {e}");
+                        }
                     }
                 } else {
-                    log::debug!("indexer: face env incomplete, deferring face pass");
+                    // Warn, not debug: the log target filters at Info, so a
+                    // missing venv or ONNX model disabled the entire face
+                    // feature with nothing at all in the log — and the People
+                    // view just showed a progress bar that never moved.
+                    let missing = [
+                        (!face::venv_ready()).then_some("face-env venv"),
+                        (!face::models_present()).then_some("ONNX models"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                    log::warn!(
+                        "indexer: face env incomplete ({missing} missing), deferring face pass for {} screenshot(s)",
+                        to_face.len()
+                    );
                 }
             }
 
@@ -465,6 +523,15 @@ mod tests {
     }
 
     #[test]
+    fn a_face_batch_that_stored_nothing_must_not_recluster() {
+        // The failing-store loop: rows offered, nothing written, yet every pass
+        // rewrote all clusters and logged "reclustered 288 faces".
+        assert!(!should_recluster(0));
+        assert!(should_recluster(1));
+        assert!(should_recluster(25));
+    }
+
+    #[test]
     fn slow_threshold_defaults_and_overrides() {
         unsafe {
             std::env::remove_var("XREENSHOTY_SLOW_IMAGE_SECS");
@@ -478,8 +545,6 @@ mod tests {
             std::env::remove_var("XREENSHOTY_SLOW_IMAGE_SECS");
         }
     }
-
-    use super::*;
 
     #[test]
     fn batch_and_poll_are_sane() {

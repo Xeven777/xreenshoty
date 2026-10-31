@@ -44,6 +44,7 @@ notify = { version = "6", default-features = false, features = ["macos_fsevent"]
 x11rb = "0.13"
 
 
+
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
 codegen-units = 1
@@ -51,3 +52,9 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+[profile.dev]
+codegen-units = 16
+lto = false
+debug = true
+opt-level = 1

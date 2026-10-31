@@ -74,28 +74,56 @@ export async function shortcutAvailable(accel: string) {
   return !(await isRegistered(accel))
 }
 
+const chains = new Map<string, Promise<void>>()
+
+/**
+ * Run `op` after every earlier operation on the same accelerator. Bind and
+ * release are each a pair of round trips (`isRegistered` then `register`), so
+ * without this a bind that is still in flight when its effect is torn down
+ * lands *after* the cleanup's release and holds the accelerator for the rest of
+ * the session — and a late release can just as easily unregister an accelerator
+ * a newer effect now owns (M2).
+ */
+function serialized<T>(accel: string, op: () => Promise<T>): Promise<T> {
+  const previous = chains.get(accel) ?? Promise.resolve()
+  const run = previous.then(op, op)
+  const settled: Promise<void> = run.then(
+    () => undefined,
+    () => undefined
+  )
+  chains.set(accel, settled)
+  void settled.then(() => {
+    if (chains.get(accel) === settled) chains.delete(accel)
+  })
+  return run
+}
+
 /**
  * Register a global shortcut. Returns an error message when the accelerator is
  * already claimed by another app, so the UI can surface it.
  */
-export async function bindShortcut(accel: string, handler: () => void) {
-  if (!accel) return null
-  if (await isRegistered(accel)) {
-    return `${prettyAccelerator(accel)} is already used by another app`
-  }
-  try {
-    await register(accel, handler)
-    return null
-  } catch (e) {
-    return `Could not register ${prettyAccelerator(accel)}: ${String(e)}`
-  }
+export function bindShortcut(accel: string, handler: () => void) {
+  if (!accel) return Promise.resolve<string | null>(null)
+  return serialized(accel, async () => {
+    if (await isRegistered(accel)) {
+      return `${prettyAccelerator(accel)} is already used by another app`
+    }
+    try {
+      await register(accel, handler)
+      return null
+    } catch (e) {
+      return `Could not register ${prettyAccelerator(accel)}: ${String(e)}`
+    }
+  })
 }
 
 export async function releaseShortcut(accel: string) {
   if (!accel) return
-  try {
-    if (await isRegistered(accel)) await unregister(accel)
-  } catch {
-    /* already gone */
-  }
+  await serialized(accel, async () => {
+    try {
+      if (await isRegistered(accel)) await unregister(accel)
+    } catch {
+      /* already gone */
+    }
+  })
 }

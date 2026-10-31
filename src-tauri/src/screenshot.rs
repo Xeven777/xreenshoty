@@ -468,7 +468,7 @@ pub async fn open_folder(path: Option<String>) -> Result<(), String> {
 
 /// Stable FNV-1a hash. Used only as a cache filename, so it just has to be
 /// deterministic across runs — `DefaultHasher` is explicitly not.
-fn cache_key(parts: &[&[u8]]) -> String {
+pub(crate) fn cache_key(parts: &[&[u8]]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for part in parts {
         for byte in *part {
@@ -482,7 +482,7 @@ fn cache_key(parts: &[&[u8]]) -> String {
 /// Root of the on-disk thumbnail cache. `None` only when the OS reports no
 /// cache dir at all, in which case nothing is ever cached and nothing is
 /// clearable.
-fn thumb_cache_dir() -> Option<PathBuf> {
+pub(crate) fn thumb_cache_dir() -> Option<PathBuf> {
     Some(dirs::cache_dir()?.join("xreenshoty").join("thumbs"))
 }
 
@@ -503,6 +503,23 @@ fn thumb_cache_file(path: &Path, size: u32) -> Option<PathBuf> {
         &meta.len().to_le_bytes(),
     ]);
     thumb_cache_dir().map(|d| d.join(format!("{key}.png")))
+}
+
+/// Cache file for a cropped face tile. Keyed by source path + box + size, not
+/// by face id: `set_faces` deletes and reinserts rows, and SQLite can reuse a
+/// rowid, so an id-keyed cache could serve the wrong face. The box and path
+/// together are stable for a given face.
+pub(crate) fn face_cache_file(path: &Path, box_xywh: &[f32; 4], size: u32) -> Option<PathBuf> {
+    let sig = format!(
+        "{}:{:.1}:{:.1}:{:.1}:{:.1}",
+        path.display(),
+        box_xywh[0],
+        box_xywh[1],
+        box_xywh[2],
+        box_xywh[3]
+    );
+    let key = cache_key(&[sig.as_bytes(), &size.to_le_bytes()]);
+    thumb_cache_dir().map(|d| d.join(format!("face-{key}.png")))
 }
 
 /// Downscaled PNG data URL for session-history thumbnails. Served from Rust so
